@@ -1,3 +1,8 @@
+"""Human anchors and chronological post-anchor interval reconstruction.
+
+Lineage/time choose the boundary; late events and omissions remain visible.
+Rationale: docs/package-map.md#chronological-intervals.
+"""
 from __future__ import annotations
 
 import json

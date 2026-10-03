@@ -1,3 +1,8 @@
+"""Typed optional decisions and deterministic local fallback.
+
+Fixed choices do not confer authority over source safety or chronological anchors.
+Rationale: docs/package-map.md#optional-decisions.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass

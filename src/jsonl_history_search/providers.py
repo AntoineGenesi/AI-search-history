@@ -1,3 +1,8 @@
+"""Provider names, aliases and bounded local-root hints.
+
+Store discovery is separate from provider parsing and native evidence identity.
+Rationale: docs/package-map.md#provider-records-and-identity.
+"""
 from __future__ import annotations
 
 import os

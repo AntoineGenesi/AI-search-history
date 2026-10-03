@@ -1,3 +1,8 @@
+"""Default package and explicit optional retrieval dispatch.
+
+Candidate ranking narrows reads; it cannot establish historical proof or chronology.
+Rationale: docs/package-map.md#retrieval-and-ranking.
+"""
 from __future__ import annotations
 
 import time

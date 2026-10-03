@@ -1,3 +1,8 @@
+"""Public command boundary for ordinary evidence and explicit compatibility.
+
+Routing selects the operation; primary passages, not packet gates, support answers.
+Rationale: docs/package-map.md#ordinary-history-workflow.
+"""
 from __future__ import annotations
 
 import argparse

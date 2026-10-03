@@ -2,6 +2,7 @@
 
 Text bytes are measured at binary reads. SQLite extents are conservative work
 reservations, never reported as physical I/O. Legacy callers pass no budget.
+Rationale: docs/package-map.md#bounded-source-readback.
 """
 from __future__ import annotations
 

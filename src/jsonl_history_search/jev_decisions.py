@@ -1,3 +1,8 @@
+"""Optional typed System One transport, validation and local failure fallback.
+
+Remote choice cannot replace deterministic safety or generate history proof.
+Rationale: docs/package-map.md#optional-decisions.
+"""
 from __future__ import annotations
 
 import json

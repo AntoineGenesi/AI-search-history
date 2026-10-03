@@ -2,7 +2,8 @@
 
 This operation owns no reports, continuation state, CLI, or final-answer gates.
 Ranking locates evidence; raw records establish what was said or invoked.
-Architecture: reports/jsh-1554b-architecture-addendum.md.
+Rationale: docs/package-map.md#ordinary-history-workflow.
+Decision history: reports/jsh-1554b-architecture-addendum.md.
 """
 from __future__ import annotations
 

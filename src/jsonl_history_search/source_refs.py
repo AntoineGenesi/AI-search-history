@@ -2,6 +2,7 @@
 
 Physical JSONL lines retain path/line identity. Structured stores carry a native
 locator; callers keep source-plan validation at the filesystem read boundary.
+Rationale: docs/package-map.md#provider-records-and-identity.
 """
 
 from __future__ import annotations

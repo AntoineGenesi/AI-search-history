@@ -1,3 +1,8 @@
+"""Provider normalization with raw structure, native refs and source warnings.
+
+Replay/read-only SQLite must preserve evidence and disclose partial sources.
+Rationale: docs/package-map.md#provider-records-and-identity.
+"""
 from __future__ import annotations
 
 import json

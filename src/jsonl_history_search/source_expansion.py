@@ -1,3 +1,8 @@
+"""Bounded raw readback and provider-native locator reopening.
+
+Validate source scope before reading; extra context is optional when proof is present.
+Rationale: docs/package-map.md#bounded-source-readback.
+"""
 from __future__ import annotations
 
 import json

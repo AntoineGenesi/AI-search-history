@@ -1,3 +1,8 @@
+"""Rank fusion across candidate lanes with native evidence identity.
+
+Equal display ordinals from different native records must not collide.
+Rationale: docs/package-map.md#retrieval-and-ranking.
+"""
 from __future__ import annotations
 
 from .source_refs import evidence_identity

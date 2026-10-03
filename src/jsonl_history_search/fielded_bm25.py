@@ -1,3 +1,8 @@
+"""Fielded lexical record/chunk retrieval and bounded index reuse.
+
+Index candidates retain native refs; recovery scores are not answer correctness.
+Rationale: docs/package-map.md#retrieval-and-ranking.
+"""
 from __future__ import annotations
 
 import hashlib
