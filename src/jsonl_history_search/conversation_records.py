@@ -58,6 +58,7 @@ USER_MESSAGE_PAYLOAD_TYPES = {"message", "user_message"}
 TEXT_CONTENT_TYPES = {"input_text", "text", "message_text"}
 
 INJECTED_INITIAL_TAGS = {
+    "codex_internal_context",
     "environment_context",
     "skill",
     "system-reminder",
@@ -85,6 +86,11 @@ INITIAL_TAG_RE = re.compile(r"^\s*<([a-zA-Z0-9_-]+)")
 ENVIRONMENT_MARKER_RE = re.compile(
     r"<environment_context>|</environment_context>|<cwd>|<shell>|<current_date>|<timezone>|<filesystem>",
     re.IGNORECASE,
+)
+CODEX_EXEC_WARNING_RE = re.compile(
+    r"^Warning: The maximum number of unified exec processes you can keep open is \d+ "
+    r"and you currently have \d+ processes open\. Reuse older processes or close them "
+    r"to prevent automatic pruning of old processes\s*$"
 )
 
 
@@ -145,6 +151,9 @@ def classify_conversation_record(record: Mapping[str, Any] | Record | Any) -> Co
 
     if type_markers & TURN_STATUS_TYPES or initial_tag in TURN_STATUS_INITIAL_TAGS:
         return _classification(TURN_CONTROL_OR_STATUS, "high", ["turn/status structural marker"], text)
+
+    if top_type == "response_item" and payload_role == "user" and CODEX_EXEC_WARNING_RE.fullmatch(text):
+        return _classification(TURN_CONTROL_OR_STATUS, "high", ["native Codex process-limit notification"], text)
 
     if payload_type == "subagent_notification" or top_type == "subagent_notification" or initial_tag == "subagent_notification":
         return _classification(SUBAGENT_NOTIFICATION, "high", ["subagent notification structural marker"], text)

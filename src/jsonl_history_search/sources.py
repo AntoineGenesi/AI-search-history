@@ -1433,7 +1433,8 @@ def path_is_inside(path: Path, root: Path) -> bool:
         return False
 
 
-def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None = None, budget=None):
+def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None = None, budget=None,
+                          measured_byte_admission: bool = False):
     started = time.monotonic()
     files_seen = 0
     bytes_seen = 0
@@ -1468,7 +1469,7 @@ def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None
                 warnings.append(f"Skipped symlink escape: {path}")
                 continue
             size = stat_size(path)
-            if bytes_seen + size > plan.limits.effective_bytes():
+            if not measured_byte_admission and bytes_seen + size > plan.limits.effective_bytes():
                 warnings.append("Stopped enumeration at max byte cap.")
                 return warnings
             files_seen += 1

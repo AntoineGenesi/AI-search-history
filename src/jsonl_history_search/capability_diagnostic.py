@@ -180,7 +180,8 @@ def _core_package_capability() -> Capability:
         "jsonl_history_search",
         "jsonl_history_search.cli",
         "jsonl_history_search.records",
-        "jsonl_history_search.scanner",
+        "jsonl_history_search.history_evidence",
+        "jsonl_history_search.adapters",
     ]
     failures: list[str] = []
     for module in modules:
@@ -194,7 +195,7 @@ def _core_package_capability() -> Capability:
         name="Core package importability",
         category="core",
         status=status,
-        benefit="Enables the baseline bounded source planner and Python JSONL scanner.",
+        benefit="Enables direct local ask: bounded native adapters, passage selection and measured output packing.",
         fallback="none",
         expected_slowdown_or_lost_feature="The CLI cannot run if core imports fail.",
         suggested_next_action=(
@@ -404,7 +405,7 @@ def _optional_commands_capability() -> Capability:
         category="core",
         status="available" if not missing else "degraded",
         benefit="Exposes specialized diagnostics, benchmark, manifest, and workflow evidence commands.",
-        fallback="plan_search_find",
+        fallback="direct_ask_or_native_inspection",
         expected_slowdown_or_lost_feature="Agents may need extra manual searches when specialized command surfaces are absent.",
         suggested_next_action="No action needed." if not missing else "Restore missing CLI parser entries.",
         details={"expected_commands": sorted(expected), "missing_commands": missing},

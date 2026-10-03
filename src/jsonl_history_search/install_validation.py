@@ -84,7 +84,6 @@ def validate_install(
             assets=claude_skill_assets,
         ),
         _check_package_helpers(root, source_checkout=source_checkout, assets=skill_assets),
-        _check_package_helper_behavior(root, source_checkout=source_checkout),
         _check_package_ask_first_launcher_behavior(root, source_checkout=source_checkout),
         _check_safe_root_rejection(root),
     ]
@@ -829,7 +828,6 @@ def _check_package_helpers(
     assets: CodexSkillAssets | None = None,
 ) -> ValidationCheck:
     helpers = [
-        package_root / "scripts" / "search_jsonl_history.py",
         package_root / "scripts" / "jsonl_ask_first.py",
         package_root / "scripts" / "git_jsonl_forensics.py",
     ]
@@ -849,7 +847,7 @@ def _check_package_helpers(
             name="Packaged Codex skill helpers",
             status="pass",
             detail="Optional Codex skill helper assets are bundled with the installed Python package.",
-            paths=[str(assets.search_helper), str(assets.ask_first_helper)],
+            paths=[str(assets.ask_first_helper)],
             metadata={"source_checkout": False, "asset_source": assets.source},
         )
     if not source_checkout:
@@ -869,7 +867,7 @@ def _check_package_helpers(
     if missing:
         recovery.append("Restore missing helper scripts from the package checkout.")
     if not_executable:
-        recovery.append("Run `chmod +x scripts/search_jsonl_history.py scripts/jsonl_ask_first.py scripts/git_jsonl_forensics.py`.")
+        recovery.append("Run `chmod +x scripts/jsonl_ask_first.py scripts/git_jsonl_forensics.py`.")
     return ValidationCheck(
         id="package_helpers",
         name="Package helper executability",
@@ -883,224 +881,44 @@ def _check_package_helpers(
     )
 
 
-def _check_package_helper_behavior(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
-    helper = package_root / "scripts" / "search_jsonl_history.py"
-    if not source_checkout:
-        return ValidationCheck(
-            id="package_helper_smoke",
-            name="Package helper behavior smoke",
-            status="skip",
-            detail="Package helper behavior smoke is skipped outside a source checkout.",
-            paths=[str(helper)],
-            metadata={"source_checkout": False},
-        )
-    if not helper.is_file() or not os.access(helper, os.X_OK):
-        return ValidationCheck(
-            id="package_helper_smoke",
-            name="Package helper behavior smoke",
-            status="skip",
-            detail="Package helper behavior smoke is skipped because the helper is missing or not executable.",
-            paths=[str(helper)],
-            recovery=["Restore executable helper scripts before running the behavior smoke."],
-        )
-
-    query = "restart handoff artifact changed next work plan docs cleanup worktree cleanup"
-    with tempfile.TemporaryDirectory(prefix="jsonl-history-search-helper-") as raw_tmp:
-        tmp = Path(raw_tmp)
-        transcript = tmp / "case.jsonl"
-        transcript.write_text(
-            json.dumps(
-                {
-                    "role": "user",
-                    "timestamp": "2026-06-11T01:02:03Z",
-                    "text": "handoff document moved into a task worktree; cleanup docs and restart plan changed",
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        wrong_root = tmp / "not-json.txt"
-        wrong_root.write_text("not jsonl\n", encoding="utf-8")
-        recovered = _run_helper_json(helper, query, transcript)
-        empty = _run_helper_json(helper, query, wrong_root)
-
-    recovered_ok = (
-        recovered.get("returncode") == 0
-        and recovered.get("payload", {}).get("searched_files") == 1
-        and len(recovered.get("payload", {}).get("matches", [])) == 1
-    )
-    empty_ok = (
-        empty.get("returncode") == 0
-        and empty.get("payload", {}).get("searched_files") == 0
-        and empty.get("payload", {}).get("matches") == []
-    )
-    ok = recovered_ok and empty_ok
-    return ValidationCheck(
-        id="package_helper_smoke",
-        name="Package helper behavior smoke",
-        status="pass" if ok else "fail",
-        detail=(
-            "Package helper recovers non-contiguous broad query terms and does not search cwd for empty roots."
-            if ok
-            else "Package helper behavior smoke failed for broad-query recovery or empty-root handling."
-        ),
-        paths=[str(helper)],
-        recovery=[] if ok else ["Inspect `scripts/search_jsonl_history.py` rg parsing, broad fallback, and empty-root guards."],
-        metadata={
-            "broad_query_recovered": recovered_ok,
-            "empty_root_no_cwd_search": empty_ok,
-            "broad_query_returncode": recovered.get("returncode"),
-            "empty_root_returncode": empty.get("returncode"),
-        },
-    )
-
-
-def _run_helper_json(helper: Path, query: str, root: Path) -> dict[str, Any]:
-    result = run_subprocess(
-        [sys.executable, str(helper), query, "--roots", str(root), "--limit", "5"],
-        text=True,
-        stdout=PIPE,
-        stderr=PIPE,
-        check=False,
-    )
-    payload: dict[str, Any] = {}
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        pass
-    return {"returncode": result.returncode, "payload": payload}
-
-
 def _check_package_ask_first_launcher_behavior(package_root: Path, *, source_checkout: bool = True) -> ValidationCheck:
     launcher = package_root / "scripts" / "jsonl_ask_first.py"
-    if not source_checkout:
-        return ValidationCheck(
-            id="package_ask_first_launcher_smoke",
-            name="Package ask-first launcher smoke",
-            status="skip",
-            detail="Package ask-first launcher smoke is skipped outside a source checkout.",
-            paths=[str(launcher)],
-            metadata={"source_checkout": False},
-        )
-    if not launcher.is_file() or not os.access(launcher, os.X_OK):
-        return ValidationCheck(
-            id="package_ask_first_launcher_smoke",
-            name="Package ask-first launcher smoke",
-            status="skip",
-            detail="Package ask-first launcher smoke is skipped because the launcher is missing or not executable.",
-            paths=[str(launcher)],
-            recovery=["Restore executable `scripts/jsonl_ask_first.py` before running the behavior smoke."],
-        )
-
-    env = os.environ.copy()
-    route_result = run_subprocess(
-        [sys.executable, str(launcher), "why", "did", "I", "mention", "the", "router?"],
-        text=True,
-        stdout=PIPE,
-        stderr=PIPE,
-        check=False,
-        cwd=str(package_root),
-        env=env,
-    )
-    route_stdout = route_result.stdout
-    installed_first_command = "First command: jsonl-history-search semantic-debug"
-    source_first_command = (
-        "First command: PYTHONPATH=src python3 -m jsonl_history_search.cli semantic-debug"
-    )
-    if installed_first_command in route_stdout:
-        first_command_mode = "installed_console"
-    elif source_first_command in route_stdout:
-        first_command_mode = "source_checkout"
-    else:
-        first_command_mode = "unresolved"
-    bounded_payload: dict[str, Any] = {}
-    bounded_returncode: int | None = None
-    bounded_stderr = ""
-    with tempfile.TemporaryDirectory(prefix="jsonl-ask-first-smoke-") as tmp:
-        tmp_path = Path(tmp)
-        root = tmp_path / "sessions"
-        root.mkdir()
-        (root / "session.jsonl").write_text(
-            '{"timestamp":"2026-05-27T09:00:00+00:00","role":"user","text":"alpha only"}\n',
-            encoding="utf-8",
-        )
-        report_output = tmp_path / "ask-first-no-evidence.json"
-        bounded_result = run_subprocess(
-            [
-                sys.executable,
-                str(launcher),
-                "did",
-                "the",
-                "searched",
-                "scope",
-                "contain",
-                "unmatched",
-                "phrase?",
-                "--cwd",
-                str(tmp_path),
-                "--root",
-                str(root),
-                "--allow-arbitrary-root",
-                "--hard-cap-files",
-                "5",
-                "--hard-cap-bytes",
-                "10000",
-                "--report-output",
-                str(report_output),
-                "--format",
-                "json",
-            ],
-            text=True,
-            stdout=PIPE,
-            stderr=PIPE,
-            check=False,
-            cwd=str(package_root),
-            env=env,
-        )
-        bounded_returncode = bounded_result.returncode
-        bounded_stderr = bounded_result.stderr
-        try:
-            bounded_payload = json.loads(bounded_result.stdout).get("ask_execute", {})
-        except json.JSONDecodeError:
-            bounded_payload = {}
-    ok = (
-        route_result.returncode == 0
-        and "Ask Route" in route_stdout
-        and first_command_mode in {"installed_console", "source_checkout"}
-        and "--cwd \"$PWD\"" in route_stdout
-        and "--format text" in route_stdout
-        and "Read: references/remembered-topic.md" in route_stdout
-        and bounded_returncode == 0
-        and bounded_payload.get("execution_status") == "executed"
-        and bounded_payload.get("selected_route", {}).get("route_family") == "bounded_no_evidence"
-        and bounded_payload.get("execution", {}).get("command_family") == "no-evidence-report"
-        and bounded_payload.get("answer_action_contract", {}).get("answer_status") == "answer-scoped-no-evidence-now"
-    )
-    return ValidationCheck(
-        id="package_ask_first_launcher_smoke",
-        name="Package ask-first launcher smoke",
-        status="pass" if ok else "fail",
-        detail=(
-            "Package ask-first launcher keeps non-bounded prompts route-only and auto-executes bounded no-evidence."
-            if ok
-            else "Package ask-first launcher did not satisfy the route-only plus bounded no-evidence auto-execute contract."
-        ),
-        paths=[str(launcher)],
-        recovery=[] if ok else ["Run `python3 scripts/jsonl_ask_first.py \"did the searched scope contain unmatched phrase?\" --root <fixture-root> --allow-arbitrary-root --format json` from the package checkout."],
-        metadata={
-            "route_returncode": route_result.returncode,
-            "bounded_returncode": bounded_returncode,
-            "stdout_contains_ask_route": "Ask Route" in route_stdout,
-            "stdout_contains_first_command": first_command_mode != "unresolved",
-            "first_command_mode": first_command_mode,
-            "launcher_prefers_installed_console": first_command_mode == "installed_console",
-            "non_bounded_route_only": "Ask Execute" not in route_stdout,
-            "bounded_execution_status": bounded_payload.get("execution_status"),
-            "bounded_command_family": bounded_payload.get("execution", {}).get("command_family"),
-            "bounded_answer_status": bounded_payload.get("answer_action_contract", {}).get("answer_status"),
-            "stderr": (route_result.stderr + "\n" + bounded_stderr).strip()[:500],
-        },
-    )
+    if not source_checkout or not launcher.is_file():
+        return ValidationCheck(id="package_ask_first_launcher_smoke",
+            name="Package direct-ask launcher smoke", status="skip",
+            detail="Source launcher smoke is unavailable outside the checkout.", paths=[str(launcher)])
+    results = []
+    with tempfile.TemporaryDirectory(prefix="jsonl-ask-smoke-") as tmp:
+        root = Path(tmp)
+        transcript = root / "session.jsonl"
+        transcript.write_text(json.dumps({"role": "user", "text": "silver observatory original request"}) + "\n",
+                              encoding="utf-8")
+        common = ["--cwd", str(root), "--root", str(transcript), "--allow-arbitrary-root",
+                  "--hard-cap-files", "1", "--hard-cap-bytes", "10000", "--format", "json"]
+        for provider in ("codex", "claude", "gemini", "grok", "cursor"):
+            common.extend(["--" + provider + "-home", str(root / ("missing-" + provider))])
+        for provider in ("aider", "opencode"):
+            common.extend(["--" + provider + "-root", str(root / ("missing-" + provider))])
+        for query in ("silver observatory", "unmatched phrase"):
+            result = run_subprocess([sys.executable, str(launcher), query, *common],
+                text=True, stdout=PIPE, stderr=PIPE, check=False, cwd=str(package_root))
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                payload = {}
+            results.append((result.returncode, payload, result.stderr))
+    positive, absence = results
+    ok = (positive[0] == absence[0] == 0 and positive[1].get("status") == "evidence_found"
+          and any("original request" in item.get("text", "") for item in positive[1].get("evidence", []))
+          and absence[1].get("status") == "not_found" and absence[1].get("coverage", {}).get("complete")
+          and not any("ask_router" in result[1] or "ask_execute" in result[1] for result in results))
+    return ValidationCheck(id="package_ask_first_launcher_smoke",
+        name="Package direct-ask launcher smoke", status="pass" if ok else "fail",
+        detail="One direct local call opens evidence or reports complete scoped absence.",
+        paths=[str(launcher)], recovery=[] if ok else ["Inspect the direct ask launcher and core."],
+        metadata={"positive_status": positive[1].get("status"), "absence_status": absence[1].get("status"),
+                  "returncodes": [result[0] for result in results],
+                  "stderr": "\n".join(result[2] for result in results)[:500]})
 
 
 def _check_safe_root_rejection(package_root: Path) -> ValidationCheck:
@@ -1175,12 +993,13 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
 
         try:
             from .cli import _mask_context_from_args, build_parser, payload_from_args
-            from .scanner import search
+            from .history_evidence import retrieve_history_evidence
+            from .operation_budget import OperationBudget
             from .timeutil import timezone_from_args
 
             args = build_parser().parse_args(
                 [
-                    "search",
+                    "ask",
                     "validator needle alice",
                     "--format",
                     "json",
@@ -1198,14 +1017,15 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
                     "5",
                     "--redaction-profile",
                     str(profile),
+                    "--root", str(transcript), "--allow-arbitrary-root",
+                    "--hard-cap-files", "1", "--hard-cap-bytes", "10000",
                 ]
             )
             source_plan, intent, plan = payload_from_args(args)
-            result = search(
-                plan,
-                intent,
+            result = retrieve_history_evidence(
+                query=args.query, plan=plan, intent=intent,
                 default_tz=timezone_from_args(args.timezone, args.timezone_offset),
-                cwd=source_plan["cwd"],
+                budget=OperationBudget(limit_bytes=plan.limits.max_bytes, max_elapsed=plan.limits.max_elapsed),
                 mask_context=_mask_context_from_args(args),
             )
         except Exception as exc:
@@ -1228,17 +1048,13 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
                 ),
             ]
 
-        snippets = "\n".join(
-            match["snippet"] for group in result.get("groups", []) for match in group.get("matches", [])
-        )
-        redaction = (result.get("masking") or {}).get("redaction") or {}
+        snippets = "\n".join(item["text"] for item in result.get("evidence", []))
         transcript_mutated = transcript.read_bytes() != original
         redaction_ok = (
             "redacted@example.invalid" not in snippets
             and "[REDACTED:email]" in snippets
-            and redaction.get("redacted_total") == 1
         )
-        fixture_ok = result.get("searched_files") == 1 and bool(result.get("groups")) and not transcript_mutated
+        fixture_ok = result.get("coverage", {}).get("files_read") == 1 and bool(result.get("evidence")) and not transcript_mutated
         checks: list[ValidationCheck] = []
         checks.append(
             ValidationCheck(
@@ -1252,7 +1068,6 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
                 ),
                 recovery=[] if redaction_ok else ["Inspect RedactionContext and CLI redaction-profile wiring."],
                 metadata={
-                    "redacted_total": redaction.get("redacted_total"),
                     "snippet_contains_raw_email": "redacted@example.invalid" in snippets,
                     "snippet_contains_redaction": "[REDACTED:email]" in snippets,
                 },
@@ -1270,8 +1085,8 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
                 ),
                 recovery=[] if fixture_ok else ["Inspect source planning, scanner enumeration, and fixture JSONL parsing."],
                 metadata={
-                    "searched_files": result.get("searched_files"),
-                    "match_groups": len(result.get("groups", [])),
+                    "files_read": result.get("coverage", {}).get("files_read"),
+                    "opened_passages": len(result.get("evidence", [])),
                     "fixture_transcript_mutated": transcript_mutated,
                 },
             )
@@ -1292,7 +1107,6 @@ def _check_global_codex_install(
     alias_policy = alias_skill.parent / "agents" / "openai.yaml"
     skill = skill_root / "SKILL.md"
     references = skill_root / "references"
-    helper = skill_root / "scripts" / "search_jsonl_history.py"
     ask_first_launcher = skill_root / "scripts" / "jsonl_ask_first.py"
     package_skill_root = assets.root if assets is not None else package_root / "skills" / "codex" / "jsonl-history-search"
     package_skill = assets.skill if assets is not None else package_skill_root / "SKILL.md"
@@ -1304,11 +1118,11 @@ def _check_global_codex_install(
         else package_alias_skill.parent / "agents" / "openai.yaml"
     )
     package_references = assets.references if assets is not None else package_skill_root / "references"
-    package_helper = assets.search_helper if assets is not None else package_root / "scripts" / "search_jsonl_history.py"
     package_ask_first_launcher = assets.ask_first_helper if assets is not None else package_root / "scripts" / "jsonl_ask_first.py"
     compare_packaged = assets is not None or source_checkout
     checks: list[ValidationCheck] = []
     checks.append(_check_global_backup_skill_dirs(codex_home))
+    checks.append(_check_retired_search_helper(skill_root, 'global_', 'Codex'))
     if skill.is_file():
         checks.append(_global_copy_check("global_skill", "Global Codex skill file", skill, package_skill, compare_packaged=compare_packaged))
     else:
@@ -1380,19 +1194,6 @@ def _check_global_codex_install(
                 detail="Global Codex skill references folder is missing at the provided --codex-home.",
                 paths=[str(references)],
                 recovery=["Run `jsonl-history-search install-codex-skill` to install the routed references folder."],
-            )
-        )
-    if helper.is_file() and os.access(helper, os.X_OK):
-        checks.append(_global_copy_check("global_helper", "Global Codex helper script", helper, package_helper, compare_packaged=compare_packaged))
-    else:
-        checks.append(
-            ValidationCheck(
-                id="global_helper",
-                name="Global Codex helper executability",
-                status="fail",
-                detail="Global Codex helper is missing or not executable at the provided --codex-home.",
-                paths=[str(helper)],
-                recovery=["Run `jsonl-history-search install-codex-skill` to install the helper scripts."],
             )
         )
     if ask_first_launcher.is_file() and os.access(ask_first_launcher, os.X_OK):
@@ -1542,10 +1343,6 @@ def _check_global_agent_install(
             else package_alias_skill.parent / "agents" / "openai.yaml",
         ),
         "references": (skill_root / "references", package_skill_root / "references"),
-        "helper": (
-            skill_root / "scripts" / "search_jsonl_history.py",
-            assets.search_helper if assets is not None else package_root / "scripts" / "search_jsonl_history.py",
-        ),
         "ask_first_launcher": (
             skill_root / "scripts" / "jsonl_ask_first.py",
             assets.ask_first_helper if assets is not None else package_root / "scripts" / "jsonl_ask_first.py",
@@ -1563,6 +1360,7 @@ def _check_global_agent_install(
             install_command=install_command,
         )
     ]
+    checks.append(_check_retired_search_helper(skill_root, id_prefix, label))
     installed, packaged = targets["skill"]
     if installed.is_file():
         checks.append(
@@ -1656,7 +1454,6 @@ def _check_global_agent_install(
             )
         )
     for key, title in (
-        ("helper", "helper script"),
         ("ask_first_launcher", "ask-first launcher"),
     ):
         installed, packaged = targets[key]
@@ -1685,6 +1482,15 @@ def _check_global_agent_install(
                 )
             )
     return checks
+
+
+def _check_retired_search_helper(skill_root: Path, prefix: str, label: str) -> ValidationCheck:
+    path = skill_root / 'scripts/search_jsonl_history.py'
+    present = path.exists() or path.is_symlink()
+    return ValidationCheck(id=prefix + 'retired_search_helper',
+        name=f'{label} retired ordinary engine absence', status='fail' if present else 'pass',
+        detail='Retired search helper remains active.' if present else 'No retired second ordinary engine is installed.',
+        paths=[str(path)], recovery=['Run the current installer to back up and retire this exact helper.'] if present else [])
 
 
 def _check_agent_backup_skill_dirs(
