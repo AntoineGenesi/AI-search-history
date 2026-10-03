@@ -4321,12 +4321,19 @@ def _session_lineage_metadata(
     except OSError:
         return {"status": "missing", "reason": "session_file_open_failed"}
     bytes_read = 0
+    metadata_warning = None
     with handle:
         for line in handle:
             if deadline is not None and time.monotonic() >= deadline:
+                if session_meta is not None:
+                    metadata_warning = "session_metadata_elapsed_cap"
+                    break
                 return {"status": "missing", "reason": "session_metadata_elapsed_cap"}
             bytes_read += len(line.encode("utf-8", errors="replace"))
             if max_bytes is not None and bytes_read > max_bytes:
+                if session_meta is not None:
+                    metadata_warning = "session_metadata_byte_cap"
+                    break
                 return {"status": "missing", "reason": "session_metadata_byte_cap"}
             try:
                 record = json.loads(line)
@@ -4379,6 +4386,7 @@ def _session_lineage_metadata(
         "cwd_relation": cwd_relation,
         "workspace_roots": workspace_roots,
         "workspace_relation": workspace_relation,
+        "metadata_warning": metadata_warning,
     }
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .source_refs import evidence_identity
+
 import hashlib
 import json
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ DEFAULT_RRF_RANK_CONSTANT = 60
 RRF_FUSION_STORAGE_FILE = "file"
 RRF_FUSION_STORAGE_MEMORY = "memory"
 RRF_FUSION_STORAGE_MODES = (RRF_FUSION_STORAGE_FILE, RRF_FUSION_STORAGE_MEMORY)
-RRF_MATERIALIZATION_SCHEMA_VERSION = 1
+RRF_MATERIALIZATION_SCHEMA_VERSION = 2
 RRF_MATERIALIZATION_LIMIT = 10_000
 
 
@@ -24,7 +26,7 @@ class RrfLane:
 
 @dataclass
 class _FusedCandidate:
-    identity: tuple[str, int]
+    identity: tuple[str, str]
     preferred_match: dict[str, Any]
     lane_matches: dict[str, dict[str, Any]]
     lane_ranks: dict[str, int]
@@ -52,7 +54,7 @@ def fuse_ranked_groups(
 
     lane_windows: dict[str, int] = {}
     lane_unique_counts: dict[str, int] = {}
-    candidates: dict[tuple[str, int], _FusedCandidate] = {}
+    candidates: dict[tuple[str, str], _FusedCandidate] = {}
     for lane in lanes:
         ranked = _ranked_unique_matches(lane.groups, candidate_window_size)
         lane_windows[lane.name] = len(ranked)
@@ -251,7 +253,7 @@ def _ranked_unique_matches(
     candidate_window_size: int | None,
 ) -> list[tuple[int, dict[str, Any]]]:
     ranked: list[tuple[int, dict[str, Any]]] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, str]] = set()
     for match in _flat_matches(groups):
         identity = _match_identity(match)
         if not identity[0] or identity in seen:
@@ -273,20 +275,15 @@ def _flat_matches(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _match_identity(match: dict[str, Any]) -> tuple[str, int]:
-    line = match.get("line")
-    try:
-        line_int = int(line)
-    except (TypeError, ValueError):
-        line_int = 0
-    return (str(match.get("path") or ""), line_int)
+def _match_identity(match: dict[str, Any]) -> tuple[str, str]:
+    return evidence_identity(match)
 
 
 def _lane_identities(
     lanes: list[RrfLane],
     lane_name: str,
     candidate_window_size: int | None,
-) -> list[tuple[str, int]]:
+) -> list[tuple[str, str]]:
     for lane in lanes:
         if lane.name == lane_name:
             return [

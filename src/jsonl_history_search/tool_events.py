@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .source_refs import evidence_ref
+
 import fnmatch
 import hashlib
 import json
@@ -281,7 +283,7 @@ def base_event_fields(record: Record, *, tool_name: str | None, payload_excerpt:
     project = project_from_raw(record.raw)
     return {
         "event_id": "",
-        "source_ref": {"path": record.path, "line": record.line, "session": session_key(record.path)},
+        "source_ref": evidence_ref(record, session=session_key(record.path)),
         "timestamp": record.timestamp.isoformat() if record.timestamp else None,
         "timestamp_utc": timestamp_utc(record.timestamp),
         "role": record.role,

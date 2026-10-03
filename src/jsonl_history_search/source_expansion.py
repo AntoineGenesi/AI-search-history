@@ -14,6 +14,7 @@ from typing import Any
 
 from .adapters import AdapterReadError, iter_records_for_file
 from .agent_contract import source_ref_target
+from .source_refs import evidence_ref, evidence_identity, native_locator_path, ref_target
 from .sources import PlannedRoot, SourcePlan, path_is_inside, source_kind_for_path
 
 
@@ -98,6 +99,7 @@ class ParsedTarget:
     path_text: str | None
     line: int | None
     raw_target: str | None
+    native_ref: str | None = None
 
 
 def build_follow_next_reads_payload(
@@ -930,9 +932,9 @@ def build_source_expansion_payload(
         return {"source_expansion": {**base_payload, "status": "invalid_projection", "records": []}}
     if not parsed.path_text:
         return {"source_expansion": {**base_payload, "status": "missing_path", "records": []}}
-    if parsed.line is None:
+    if parsed.line is None and not parsed.native_ref:
         return {"source_expansion": {**base_payload, "status": "missing_line", "records": []}}
-    if parsed.line < 1:
+    if parsed.line is not None and parsed.line < 1:
         return {"source_expansion": {**base_payload, "status": "invalid_line", "records": []}}
 
     source_path = resolve_source_path(parsed.path_text, plan=plan, cwd=cwd)
@@ -962,7 +964,18 @@ def build_source_expansion_payload(
         }
 
     total_records = len(records)
-    if parsed.line > total_records:
+    anchor_position = parsed.line
+    if parsed.native_ref:
+        positions = [index + 1 for index, record in enumerate(records)
+                     if parsed.native_ref == record.source_ref or parsed.native_ref in (record.source_refs or [])]
+        if len(positions) != 1:
+            return {"source_expansion": {**base_payload,
+                    "status": "ambiguous_native_ref" if positions else "native_ref_not_found",
+                    "records": [], "source_path": str(source_path),
+                    "matching_record_count": len(positions), "scope": source_scope(plan)}}
+        anchor_position = positions[0]
+        base_payload["anchor"]["source_ref"] = evidence_ref(records[anchor_position - 1])
+    if anchor_position is None or anchor_position > total_records:
         return {
             "source_expansion": {
                 **base_payload,
@@ -977,7 +990,7 @@ def build_source_expansion_payload(
 
     selection = select_records(
         records,
-        anchor_line=parsed.line,
+        anchor_line=anchor_position,
         mode=request.mode,
         scope=request.scope,
         before=max(0, int(request.before)),
@@ -1032,8 +1045,8 @@ def build_source_expansion_payload(
             "omitted_count": omitted_count,
             "omitted_or_truncated_count": omitted_count,
             "scope_filtered_count": int(selection["scope_filtered_count"]),
-            "before_available": max(0, parsed.line - 1),
-            "after_available": max(0, total_records - parsed.line),
+            "before_available": max(0, anchor_position - 1),
+            "after_available": max(0, total_records - anchor_position),
         },
         "truncated": omitted_count > 0,
         "boundary_flags": {
@@ -1082,6 +1095,24 @@ def build_source_expansion_payload(
         ],
         "scope": source_scope(plan),
     }
+    if parsed.native_ref:
+        positions = [index + 1 for index, record in enumerate(records)
+                     if evidence_identity(record) in {evidence_identity(item) for item in selected}]
+        start_position = min(positions) if positions else anchor_position
+        end_position = max(positions) if positions else anchor_position
+        payload["source_positions"] = {"anchor": anchor_position, "start": start_position, "end": end_position,
+                                        "meaning": "normalized source record order; not physical lines"}
+        payload["continuation"] = {
+            "semantics": "Continue from native boundary refs in normalized source record order.",
+            "more_before_available": start_position > 1, "more_after_available": end_position < total_records,
+            "scope": request.scope, "anchor": {"target": parsed.native_ref},
+            "next_steps": ([{"direction": "before", "target": ref_target(evidence_ref(selected[0])),
+                             "mode": "before", "before": request.before or request.max_records,
+                             "max_records": request.max_records, "scope": request.scope}] if selected and start_position > 1 else []) +
+                          ([{"direction": "after", "target": ref_target(evidence_ref(selected[-1])),
+                             "mode": "next", "next_count": request.next_count or request.max_records,
+                             "max_records": request.max_records, "scope": request.scope}] if selected and end_position < total_records else []),
+        }
     live_tail_caveat = payload["live_tail_caveat"]
     if live_tail_caveat.get("applies"):
         payload["claim_boundaries"] = {
@@ -2956,9 +2987,12 @@ def parse_expansion_target(target: str | None, source_ref: dict[str, Any] | None
     if source_ref:
         ref_target = source_ref_target(source_ref)
         line = _positive_int_or_none(source_ref.get("line"))
-        return ParsedTarget(path_text=str(source_ref.get("path") or "") or None, line=line, raw_target=ref_target)
+        return ParsedTarget(path_text=str(source_ref.get("path") or "") or None, line=line, raw_target=ref_target, native_ref=source_ref.get("native_ref"))
     if not target:
         return ParsedTarget(path_text=None, line=None, raw_target=None)
+    native_path = native_locator_path(str(target))
+    if native_path:
+        return ParsedTarget(path_text=native_path, line=None, raw_target=target, native_ref=target)
     path_text = str(target)
     line: int | None = None
     head, sep, tail = path_text.rpartition(":")
@@ -2974,6 +3008,8 @@ def source_ref_from_parsed_target(parsed: ParsedTarget) -> dict[str, Any]:
         ref["path"] = parsed.path_text
     if parsed.line is not None:
         ref["line"] = parsed.line
+    if parsed.native_ref:
+        ref["native_ref"] = parsed.native_ref
     return ref
 
 
@@ -3154,7 +3190,7 @@ def filter_records_by_scope(records: list[Any], anchor: Any, *, scope: str) -> l
 
 def anchor_records_only(records: list[Any], anchor: Any) -> list[Any]:
     for record in records:
-        if int(record.line) == int(anchor.line):
+        if evidence_identity(record) == evidence_identity(anchor):
             return [record]
     return []
 
@@ -3328,15 +3364,13 @@ def expanded_record(
         }
     )
     row = {
-        "source_ref": {
-            "path": str(record.path),
-            "line": int(record.line),
-        },
-        "target": f"{record.path}:{record.line}",
+        "source_ref": evidence_ref(record),
+        "target": ref_target(evidence_ref(record)),
         "line": int(record.line),
         "role": record.role,
         "timestamp": record.raw_timestamp,
         "timestamp_utc": record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
+        "timestamp_quality": record.timestamp_quality,
         "cwd": record.cwd,
         "text": projected["text"],
         "text_included": not projected["suppressed"],
