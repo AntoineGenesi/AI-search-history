@@ -164,12 +164,12 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
         {
             "id": "bounded_no_evidence",
             "question_family": "Is there evidence for this inside the searched source scope?",
-            "route": "bounded-no-evidence / no-evidence-report",
+            "route": "direct local ask / scoped lexical absence",
             "first_command": (
                 'jsonl-history-search ask "is there evidence that <claim> was discussed in this bounded source scope?" '
                 '--cwd "$PWD" --format text'
             ),
-            "inspect_next": "no_evidence_report.searched_scope, answer_scope, candidate_interpretation, and read_more_guidance",
+            "inspect_next": "scope, applied filters, coverage, omissions; lexical absence is not semantic or all-history absence",
         },
         {
             "id": "action_proof",

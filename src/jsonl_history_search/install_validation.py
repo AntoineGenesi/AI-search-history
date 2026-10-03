@@ -1017,6 +1017,8 @@ def _check_redaction_and_fixture_search() -> list[ValidationCheck]:
                     "5",
                     "--redaction-profile",
                     str(profile),
+                    "--root", str(transcript), "--allow-arbitrary-root",
+                    "--hard-cap-files", "1", "--hard-cap-bytes", "10000",
                 ]
             )
             source_plan, intent, plan = payload_from_args(args)

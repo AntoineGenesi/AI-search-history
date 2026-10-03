@@ -1,7 +1,9 @@
-# Remembered Topic Or Rationale
+# Remembered topic or rationale
 
-Use when the user asks why they mentioned a topic or what they meant by it.
+Pass the exact original question and followups to direct `ask`. Read the opened
+native passages and genuine request context; retain meaningful competing episodes
+and user corrections. A match alone does not establish the intended rationale.
 
-Run the router, open primary follow-through, and read enough surrounding turns
-to recover the reason, not one matched sentence. Prefer the original discussion.
-Preserve user corrections. Stop when the window supports the rationale; label inference.
+Use targeted bounded native reads for concrete missing context within authorized
+scope/resources. Answer supported facts, label inference and ambiguity, and stop
+on an actual unavailable/exhausted boundary rather than an arbitrary read count.

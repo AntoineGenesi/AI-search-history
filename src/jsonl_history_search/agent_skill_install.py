@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -79,6 +81,7 @@ def install_agent_skill(
     alias_policy_root = alias_root / "agents"
 
     scripts_root.mkdir(parents=True, exist_ok=True)
+    retired_assets = _retire_owned_search_helper(target_home, scripts_root)
     alias_root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(assets.skill, skill_root / "SKILL.md")
     shutil.copy2(assets.alias_skill, alias_root / "SKILL.md")
@@ -99,6 +102,7 @@ def install_agent_skill(
         "agent_skill_install": {
             "status": "installed",
             "agent": agent,
+            "retired_assets": retired_assets,
             "python_cli": {
                 "status": "available",
                 "detail": (
@@ -132,6 +136,35 @@ def install_agent_skill(
             ],
         }
     }
+
+
+def _retire_owned_search_helper(target_home: Path, scripts_root: Path) -> list[dict]:
+    """Remove only the retired executable, after an owner-only recoverable backup."""
+    target = scripts_root / 'search_jsonl_history.py'
+    if not target.exists() and not target.is_symlink():
+        return []
+    if target.is_symlink() or not target.is_file():
+        raise ValueError('Retired helper is not a regular file; inspect its exact target before upgrading.')
+    backups = target_home / 'jsonl-history-search-retired-assets'
+    if scripts_root.is_symlink() or backups.is_symlink():
+        raise ValueError('Upgrade directories must be regular local directories; inspect symlink targets first.')
+    backups.mkdir(mode=0o700, parents=True, exist_ok=True)
+    before = target.stat()
+    digest = hashlib.sha256()
+    with target.open('rb') as source, tempfile.NamedTemporaryFile(
+            dir=backups, prefix='search_jsonl_history-', suffix='.py', delete=False) as destination:
+        for chunk in iter(lambda: source.read(65536), b''):
+            digest.update(chunk)
+            destination.write(chunk)
+        destination.flush()
+        os.fsync(destination.fileno())
+        backup = Path(destination.name)
+    after = target.stat()
+    if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError('Retired helper changed during backup; original preserved, inspect before retrying.')
+    target.unlink()
+    return [{'source': str(target), 'backup': str(backup), 'sha256': digest.hexdigest(),
+             'recoverable': True}]
 
 
 def render_agent_skill_install(payload: dict[str, Any], output_format: str) -> str:

@@ -1,19 +1,16 @@
-# Latest Messages And Parent Status
+# Explicit chronological inspection
 
-```bash
-jsonl-history-search latest-user-messages --format json --max-matches 10
-jsonl-history-search latest-user-messages --cwd "$PWD" --limit 200 --snippet-chars 500 --format text
-jsonl-history-search find "<terms>" --role user --cwd "$PWD" --format text
-```
+Use `what-happened-since "<original question>" --cwd "$PWD" --format text`
+for a chronological interval, or `latest-user-messages --format json` for
+literal recent wording. Ordinary ask provides lexical passages, not a latest
+human anchor.
 
-Use the router first. Main/parent wording requires raw lineage/history evidence. Visible context and local repository state are not substitutes.
+Preserve parent/main-thread scope. Genuine human turns, not worker assignments,
+injected control messages or compaction summaries, define human boundaries.
+Read the returned anchor, native interval evidence and actual coverage. Visible
+context, summaries and Git state cannot replace missing conversation proof.
 
-Plain `anchor_ambiguous`: ask its clarification and stop; text exposes no refs, commands, or snippets. Parent-thread answer packets with `user_anchor_clarification_allowed=false` are different: do not ask the user, report the terminal blocker or exact continuation contract.
-
-Mine user turns/corrections/reactions as leads, not proof; message timestamp is not capture/report/mtime.
-Complete `ANSWER READY` output is terminal: answer from its timeline; compact
-omissions are not gaps. Do not open extra refs unless a named gap remains; then
-open the emitted record-only anchor before any wider window.
-
-Open required refs and reconstruct the anchored window. If the parent or anchor
-is ambiguous, fail closed. Treat partial interval coverage or `answer_ready=false` as a hard stop. Do not synthesize from the anchor, snippets, or summaries. Stop only at a complete raw window; otherwise report the gap.
+Summarize useful supported events even when coverage is partial; do not label
+that a complete recap. Continue targeted bounded reads for concrete available
+gaps within authorized scope/resources. Stop on actual exhaustion, unavailable
+scope or unresolved anchor ambiguity. Never guess a boundary from lexical rank.

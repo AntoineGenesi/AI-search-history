@@ -25,7 +25,7 @@ echo "  env -u PYTHONPATH jsonl-history-search validate-install --codex-home \"$
 echo "  env -u PYTHONPATH convo --help"
 echo "  env -u PYTHONPATH jsonl-history-search ask \"which prior conversation mentioned the router?\" --format text"
 echo "  (cd \"$ROOT\" && python3 \"$SKILL_DIR/scripts/jsonl_ask_first.py\" \"which prior conversation mentioned the router?\" --format text)"
-echo "  python3 \"$SKILL_DIR/scripts/search_jsonl_history.py\" --latest-user-messages --limit 1"
+echo "  env -u PYTHONPATH jsonl-history-search latest-user-messages --format json"
 echo ""
 echo "Inspect capability status with the read-only diagnostic:"
 echo "  PYTHONPATH=\"$ROOT/src\" python3 -m jsonl_history_search.cli diagnose-capabilities --format text"
