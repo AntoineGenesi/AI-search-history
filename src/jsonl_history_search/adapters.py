@@ -548,7 +548,7 @@ class CursorSqliteAdapter:
                             raw_timestamp=str(raw_timestamp) if raw_timestamp is not None else None,
                             raw={"composer": composer, "message": message}, source_format=source_kind,
                             record_id=message_id, conversation_id=composer_id, provider="cursor",
-                            source_ref=source_refs[-1] if supporting_key else source_refs[0],
+                            source_ref=source_refs[0],
                             source_refs=source_refs, native_id=message_id,
                         )
             if not emitted:

@@ -4,11 +4,15 @@ import json
 import os
 import re
 import time
+import tempfile
+from dataclasses import dataclass, field
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .latest_user_messages import _bounded_session_paths, _session_ref
 from .providers import PROVIDERS, resolve_provider_root
+from .timeutil import parse_datetime
 from .status_anchor import (
     _canonical_history_human_rows,
     _canonical_row_matches_exact_status_query_boundary,
@@ -20,7 +24,107 @@ from .status_anchor import (
 
 
 DIRECT_ANCHOR_CANDIDATE_CAP = 500
-DIRECT_RECAP_ITEM_CAP = 8
+DIRECT_OUTPUT_CHAR_BUDGET = 12000
+
+
+@dataclass
+class IntervalRead:
+    records: list[dict] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    read_failures: list[str] = field(default_factory=list)
+    malformed_count: int = 0
+    bytes_read: int = 0
+    stopped_reason: str | None = None
+
+
+def _read_interval_rows(path: Path, *, deadline: float, max_bytes: int) -> IntervalRead:
+    result = IntervalRead()
+    try:
+        if not path.stat().st_mode & 0o444:
+            raise PermissionError("source has no read permission bits")
+        with path.open("rb") as handle:
+            line_number = 0
+            while True:
+                if time.monotonic() >= deadline:
+                    result.stopped_reason = "max_elapsed"
+                    break
+                # The extra byte detects an oversized row without reading it whole.
+                raw = handle.readline(max(1, max_bytes - result.bytes_read + 1))
+                if not raw:
+                    break
+                result.bytes_read += len(raw)
+                if result.bytes_read > max_bytes:
+                    result.stopped_reason = "max_bytes"
+                    break
+                line_number += 1
+                if not raw.strip():
+                    continue
+                try:
+                    record = json.loads(raw)
+                    if not isinstance(record, Mapping):
+                        raise ValueError("not an object")
+                except (ValueError, UnicodeDecodeError):
+                    result.malformed_count += 1
+                    result.warnings.append(
+                        f"Malformed selected source row: {path}:{line_number}"
+                    )
+                    continue
+                result.records.append({"line": line_number, "raw": record})
+    except OSError as exc:
+        result.read_failures.append(f"Could not read selected source {path}: {exc}")
+    result.warnings.extend(result.read_failures)
+    if result.stopped_reason:
+        result.warnings.append(
+            f"Stopped selected source {path} at {result.stopped_reason} cap."
+        )
+    return result
+
+
+def _interval_coverage(
+    *,
+    reads: list[IntervalRead],
+    warnings: list[str],
+    scan_state: dict,
+    selected_count: int,
+    inspected: int,
+    record_count: int,
+) -> dict:
+    complete = (
+        not warnings
+        and scan_state.get("complete", True)
+        and selected_count > 0
+        and inspected == selected_count
+        and not any(
+            read.read_failures or read.malformed_count or read.stopped_reason
+            for read in reads
+        )
+    )
+    return {
+        "status": "complete"
+        if complete
+        else "partial"
+        if selected_count
+        else "missing",
+        "complete": complete,
+        "records_after_anchor": record_count,
+        "warnings": warnings,
+        "searched_files": inspected,
+        "searched_bytes": sum(read.bytes_read for read in reads),
+        "malformed_record_count": sum(read.malformed_count for read in reads),
+        "read_failures": [failure for read in reads for failure in read.read_failures],
+        "stopped_reasons": [
+            read.stopped_reason for read in reads if read.stopped_reason
+        ],
+        "file_cap_hit": scan_state.get("file_cap_hit", False),
+        "enumeration_complete": scan_state.get("complete", True),
+        "omitted_source_file_lower_bound": scan_state.get(
+            "omitted_file_lower_bound", 0
+        ),
+        "omitted_source_directory_lower_bound": scan_state.get(
+            "omitted_directory_lower_bound", 0
+        ),
+    }
+
 
 _LATEST_MESSAGE_INTERVAL_RE = re.compile(
     r"\b(?:since|after)\s+(?:my|i)\s+(?:last|previous)?\s*(?:message|messaged|said|asked|wrote|told)\b"
@@ -36,7 +140,9 @@ def is_direct_latest_message_history_query(query: str) -> bool:
     return bool(_LATEST_MESSAGE_INTERVAL_RE.search(normalized))
 
 
-def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None = None) -> dict:
+def build_direct_history_answer_payload(
+    args: Any, *, route_payload: dict | None = None
+) -> dict:
     """Answer latest-status questions without packet or continuation choreography."""
 
     query = str(getattr(args, "query", "") or "").strip()
@@ -58,6 +164,36 @@ def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None
             limits=limits,
             deadline=deadline,
         )
+    if provider != "codex":
+        selection = {
+            "status": "unsupported",
+            "reason": f"{provider}_parent_lineage_unsupported",
+            "boundary": {
+                "provider": provider,
+                "root": str(resolve_provider_root(args, provider=provider, cwd=cwd)),
+            },
+            "recovery": "ordinary_provider_search_available",
+        }
+        result = _boundary_answer(
+            query=query,
+            cwd=cwd,
+            route=route,
+            selection=selection,
+            inventory=inventory,
+            limits=limits,
+        )
+        result["source_contract"]["provider_capability"] = {
+            "provider": provider,
+            "parent_lineage": "unsupported",
+            "ordinary_search": "supported",
+            "source_boundary": selection["boundary"],
+        }
+        result["next_proof_step"] = {
+            "required_next_proof": "Use ordinary search/find in the selected provider root; parent lineage is unavailable.",
+            "provider": provider,
+            "root": selection["boundary"]["root"],
+        }
+        return {"ask_answer": result}
 
     codex_home = resolve_provider_root(args, provider="codex", cwd=cwd)
 
@@ -91,7 +227,16 @@ def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None
             "recovery": "bounded_same_root_recovery_stopped_at_max_elapsed",
             "selected_anchor": selection.get("selected_anchor"),
         }
-        return {"ask_answer": _boundary_answer(query=query, cwd=cwd, route=route, selection=selection, inventory=inventory, limits=limits)}
+        return {
+            "ask_answer": _boundary_answer(
+                query=query,
+                cwd=cwd,
+                route=route,
+                selection=selection,
+                inventory=inventory,
+                limits=limits,
+            )
+        }
     reconstruction = _reconstruct_codex_interval(
         selection=selection,
         codex_home=codex_home,
@@ -101,16 +246,27 @@ def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None
     selected = reconstruction["selected_anchor"]
     interval = reconstruction["interval"]
     coverage = reconstruction["coverage"]
-    activity = [item for item in interval.get("chronological_activity") or [] if isinstance(item, dict)]
-    recap_items = _recap_items(activity)
-    refs = _answer_refs(selected, interval, activity)
+    activity = [
+        item
+        for item in interval.get("chronological_activity") or []
+        if isinstance(item, dict)
+    ]
+    preview, output_coverage = _present_interval(activity, args=args)
+    recap_items = _recap_items(preview)
+    refs = _answer_refs(selected, interval, preview)
 
     anchor_matches = str(selected.get("source_ref") or "") == str(
         selection["selected_anchor"].get("source_ref") or ""
     )
     complete = coverage.get("complete") is True
-    has_raw_interval = bool(activity) and int(coverage.get("records_after_anchor") or 0) > 0
-    answer_status = "answered-from-proof" if anchor_matches and complete and has_raw_interval else "partial"
+    has_raw_interval = (
+        bool(activity) and int(coverage.get("records_after_anchor") or 0) > 0
+    )
+    answer_status = (
+        "answered-from-proof"
+        if anchor_matches and complete and has_raw_interval
+        else "partial"
+    )
     fail_reason = None
     if not anchor_matches:
         answer_status = "ambiguous"
@@ -120,6 +276,9 @@ def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None
         fail_reason = "no raw post-anchor interval records were found in the bounded selected session lineage"
     elif not complete:
         fail_reason = "the retrieved post-anchor interval is partial; omitted or missing scope is reported below"
+    if output_coverage.get("artifact_error") and answer_status == "answered-from-proof":
+        answer_status = "partial"
+        fail_reason = "The full interval artifact could not be written; only the disclosed preview is available."
 
     answer_text = _answer_text(
         selected=selected or selection["selected_anchor"],
@@ -127,6 +286,8 @@ def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None
         recap_items=recap_items,
         answer_status=answer_status,
     )
+    if not output_coverage["complete"]:
+        answer_text = "Bounded evidence preview. " + answer_text
     source_contract = {
         "built_from": "direct_history_answer",
         "answer_action_status": answer_status,
@@ -141,10 +302,13 @@ def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None
             "chronological_entry_count": interval.get("chronological_entry_count"),
         },
         "coverage": coverage,
+        "output_coverage": output_coverage,
         "missing_or_capped_scope": _missing_or_capped_scope(interval, coverage),
         "source_inventory": inventory,
         "limits": limits,
-        "native_source_refs": [item.get("source_ref") for item in refs if item.get("source_ref")],
+        "native_source_refs": [
+            item.get("source_ref") for item in refs if item.get("source_ref")
+        ],
         "visible_context_used_as_proof": False,
         "legacy_packet_or_execute_continuation_used": False,
     }
@@ -164,7 +328,9 @@ def build_direct_history_answer_payload(args: Any, *, route_payload: dict | None
             "refs_used": refs,
             "proof_summary": recap_items,
             "fail_closed_reason": fail_reason,
-            "next_proof_step": _next_boundary(interval, coverage) if answer_status != "answered-from-proof" else None,
+            "next_proof_step": _next_boundary(interval, coverage)
+            if answer_status != "answered-from-proof"
+            else None,
             "source_role_explanation": None,
             "source_contract": source_contract,
         }
@@ -410,22 +576,34 @@ def _latest_matching_parent_row(
     return None
 
 
-def _build_lineage_index(*, codex_home: Path, cwd: Path, max_files: int, deadline: float) -> dict:
+def _build_lineage_index(
+    *, codex_home: Path, cwd: Path, max_files: int, deadline: float
+) -> dict:
     warnings: list[str] = []
     scan_state: dict[str, Any] = {}
-    paths = _bounded_session_paths(
-        codex_home / "sessions",
-        limit=max_files,
-        deadline=deadline,
-        warnings=warnings,
-        scan_state=scan_state,
-    ) if (codex_home / "sessions").is_dir() else []
+    paths = (
+        _bounded_session_paths(
+            codex_home / "sessions",
+            limit=max_files,
+            deadline=deadline,
+            warnings=warnings,
+            scan_state=scan_state,
+        )
+        if (codex_home / "sessions").is_dir()
+        else []
+    )
     by_hash: dict[str, dict] = {}
     for path in paths:
         if time.monotonic() >= deadline:
             warnings.append("Stopped lineage metadata reads at max elapsed cap.")
             break
-        meta = _session_lineage_metadata(path, cwd=cwd, deadline=deadline, max_bytes=256 * 1024)
+        meta = _session_lineage_metadata(
+            path, cwd=cwd, deadline=deadline, max_bytes=256 * 1024
+        )
+        if meta.get("status") != "ok" or meta.get("metadata_warning"):
+            warnings.append(
+                f"Incomplete lineage metadata for {path}: {meta.get('metadata_warning') or meta.get('reason') or 'unavailable'}"
+            )
         for key in ("session_id_hash", "raw_thread_id_hash"):
             if meta.get(key):
                 by_hash[str(meta[key])] = meta
@@ -512,12 +690,16 @@ def _reconstruct_codex_interval(
     selected = dict(selection["selected_anchor"])
     anchor_hash = _source_identifier_hash(selected)
     anchor_timestamp = str(selected.get("timestamp_utc") or "")
-    boundary = selection.get("boundary") if isinstance(selection.get("boundary"), dict) else {}
+    boundary = (
+        selection.get("boundary") if isinstance(selection.get("boundary"), dict) else {}
+    )
     boundary_timestamp = str(boundary.get("timestamp_utc") or "")
     index = selection.get("_lineage_index") or {}
     metas = [
-        meta for meta in index.get("metas", [])
-        if anchor_hash in {
+        meta
+        for meta in index.get("metas", [])
+        if anchor_hash
+        in {
             str(meta.get("session_id_hash") or ""),
             str(meta.get("raw_thread_id_hash") or ""),
             str(meta.get("parent_thread_id_hash") or ""),
@@ -528,9 +710,12 @@ def _reconstruct_codex_interval(
     warnings = list(index.get("warnings") or [])
     bytes_read = 0
     inspected = 0
+    reads: list[IntervalRead] = []
     for meta in metas:
         if time.monotonic() >= deadline:
-            warnings.append("Stopped before the next Codex lineage file at max elapsed cap.")
+            warnings.append(
+                "Stopped before the next Codex lineage file at max elapsed cap."
+            )
             break
         path = Path(str(meta.get("session_source_ref") or ""))
         try:
@@ -539,36 +724,51 @@ def _reconstruct_codex_interval(
             warnings.append(f"Could not stat selected lineage source: {path}")
             continue
         if bytes_read + size > max_bytes:
-            warnings.append("Stopped before the next Codex lineage file at max byte cap.")
+            warnings.append(
+                "Stopped before the next Codex lineage file at max byte cap."
+            )
             break
-        bytes_read += size
-        records = _read_codex_activity(path, codex_home=codex_home, deadline=deadline)
-        if records is None:
-            warnings.append("Stopped within a Codex lineage file at max elapsed cap.")
-            break
+        read = _read_codex_activity(
+            path,
+            codex_home=codex_home,
+            deadline=deadline,
+            max_bytes=max_bytes - bytes_read,
+        )
+        reads.append(read)
+        bytes_read += read.bytes_read
+        warnings.extend(read.warnings)
         inspected += 1
-        for record in records:
+        for record in read.records:
             timestamp = str(record.get("timestamp_utc") or "")
             if anchor_timestamp and timestamp and timestamp <= anchor_timestamp:
                 continue
             if boundary_timestamp and timestamp and timestamp >= boundary_timestamp:
                 continue
+            if not timestamp:
+                warnings.append(
+                    f"Post-anchor activity has unknown timestamp: {record['source_ref']}"
+                )
             activities.append(record)
-    activities.sort(key=lambda item: (str(item.get("timestamp_utc") or ""), str(item.get("source_ref") or "")))
-    scan_state = index.get("scan_state") if isinstance(index.get("scan_state"), dict) else {}
-    complete = not warnings and scan_state.get("complete", True) and bool(metas) and inspected == len(metas)
-    coverage = {
-        "status": "complete" if complete else "partial" if metas else "missing",
-        "complete": complete,
-        "records_after_anchor": len(activities),
-        "warnings": warnings,
-        "searched_files": inspected,
-        "searched_bytes": bytes_read,
-        "file_cap_hit": scan_state.get("file_cap_hit", False),
-        "enumeration_complete": scan_state.get("complete", True),
-        "omitted_source_file_lower_bound": scan_state.get("omitted_file_lower_bound", 0),
-        "omitted_source_directory_lower_bound": scan_state.get("omitted_directory_lower_bound", 0),
-    }
+        if read.stopped_reason:
+            break
+    activities.sort(
+        key=lambda item: (
+            str(item.get("timestamp_utc") or ""),
+            str(item.get("source_path") or ""),
+            int(item.get("source_line") or 0),
+        )
+    )
+    scan_state = (
+        index.get("scan_state") if isinstance(index.get("scan_state"), dict) else {}
+    )
+    coverage = _interval_coverage(
+        reads=reads,
+        warnings=warnings,
+        scan_state=scan_state,
+        selected_count=len(metas),
+        inspected=inspected,
+        record_count=len(activities),
+    )
     interval = {
         "anchor": _public_anchor(selected),
         "boundary": boundary,
@@ -580,58 +780,72 @@ def _reconstruct_codex_interval(
     return {"selected_anchor": selected, "interval": interval, "coverage": coverage}
 
 
-def _read_codex_activity(path: Path, *, codex_home: Path, deadline: float) -> list[dict] | None:
+def _read_codex_activity(
+    path: Path, *, codex_home: Path, deadline: float, max_bytes: int
+) -> IntervalRead:
+    result = _read_interval_rows(path, deadline=deadline, max_bytes=max_bytes)
     activities: list[dict] = []
-    try:
-        handle = path.open("r", encoding="utf-8", errors="replace")
-    except OSError:
-        return activities
-    with handle:
-        for line_number, line in enumerate(handle, 1):
-            if time.monotonic() >= deadline:
-                return None
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(record, Mapping):
-                continue
-            payload = record.get("payload") if isinstance(record.get("payload"), Mapping) else {}
-            timestamp = str(record.get("timestamp") or payload.get("timestamp") or "")
-            activity_kind = None
-            classification = None
-            snippet = ""
-            if payload.get("type") == "message" and str(payload.get("role") or "") in {"user", "assistant"}:
-                role = str(payload.get("role"))
-                content = payload.get("content")
-                if isinstance(content, list):
-                    snippet = " ".join(
-                        str(item.get("text") or "") for item in content if isinstance(item, Mapping)
-                    )
-                else:
-                    snippet = str(content or "")
-                activity_kind = f"{role}_message"
-                classification = "human_user_message" if role == "user" else "assistant_message"
-            elif payload.get("type") in {"function_call", "custom_tool_call", "tool_call"}:
-                snippet = str(payload.get("name") or "tool call")
-                activity_kind = "tool_call"
-                classification = "tool_action"
-            elif payload.get("type") in {"function_call_output", "custom_tool_call_output", "tool_call_output"}:
-                snippet = str(payload.get("output") or "tool output")
-                activity_kind = "tool_output"
-                classification = "tool_action_output"
-            snippet = " ".join(snippet.split())[:1000]
-            if not activity_kind or not snippet:
-                continue
-            activities.append({
+    for row in result.records:
+        line_number, record = row["line"], row["raw"]
+        payload = (
+            record.get("payload") if isinstance(record.get("payload"), Mapping) else {}
+        )
+        parsed_time = parse_datetime(
+            record.get("timestamp") or payload.get("timestamp"), timezone.utc
+        )
+        timestamp = (
+            parsed_time.astimezone(timezone.utc).isoformat() if parsed_time else ""
+        )
+        activity_kind = None
+        classification = None
+        snippet = ""
+        if payload.get("type") == "message" and str(payload.get("role") or "") in {
+            "user",
+            "assistant",
+        }:
+            role = str(payload.get("role"))
+            content = payload.get("content")
+            if isinstance(content, list):
+                snippet = " ".join(
+                    str(item.get("text") or "")
+                    for item in content
+                    if isinstance(item, Mapping)
+                )
+            else:
+                snippet = str(content or "")
+            activity_kind = f"{role}_message"
+            classification = (
+                "human_user_message" if role == "user" else "assistant_message"
+            )
+        elif payload.get("type") in {"function_call", "custom_tool_call", "tool_call"}:
+            snippet = str(payload.get("name") or "tool call")
+            activity_kind = "tool_call"
+            classification = "tool_action"
+        elif payload.get("type") in {
+            "function_call_output",
+            "custom_tool_call_output",
+            "tool_call_output",
+        }:
+            snippet = str(payload.get("output") or "tool output")
+            activity_kind = "tool_output"
+            classification = "tool_action_output"
+        snippet = " ".join(snippet.split())
+        if not activity_kind or not snippet:
+            continue
+        activities.append(
+            {
                 "timestamp_utc": timestamp,
                 "activity_kind": activity_kind,
                 "classification": classification,
                 "snippet": snippet,
                 "source_ref": _session_ref(path, codex_home, line_number),
                 "openable_target": f"{path}:{line_number}",
-            })
-    return activities
+                "source_path": str(path),
+                "source_line": line_number,
+            }
+        )
+    result.records = activities
+    return result
 
 
 def _recap_items(activity: list[dict]) -> list[str]:
@@ -642,9 +856,110 @@ def _recap_items(activity: list[dict]) -> list[str]:
             continue
         kind = str(entry.get("activity_kind") or "activity").replace("_", " ")
         items.append(f"{kind}: {snippet}")
-        if len(items) >= DIRECT_RECAP_ITEM_CAP:
-            break
-    return _dedupe(items)[:DIRECT_RECAP_ITEM_CAP]
+    return items
+
+
+def _present_interval(activity: list[dict], *, args: Any) -> tuple[list[dict], dict]:
+    """Choose stdout evidence once; keep source completeness independent."""
+
+    def evidence_text(entry: dict) -> str:
+        return f"{entry.get('timestamp_utc') or '(unknown time)'} {entry.get('activity_kind')} {entry.get('openable_target') or entry.get('source_ref')}\n{entry.get('snippet') or ''}\n"
+
+    full_text = "\n".join(evidence_text(entry) for entry in activity)
+    coverage = {
+        "complete": True,
+        "total_record_count": len(activity),
+        "displayed_record_count": len(activity),
+        "omitted_record_count": 0,
+        "omitted_ranges": [],
+        "truncated_record_count": 0,
+        "artifact_path": None,
+        "artifact_error": None,
+        "omitted_text_char_count": 0,
+        "truncated_records": [],
+    }
+    if len(full_text) <= DIRECT_OUTPUT_CHAR_BUDGET:
+        return activity, coverage
+    chosen: dict[int, dict] = {}
+    remaining = DIRECT_OUTPUT_CHAR_BUDGET
+    # Alternate beginning/end so terminal outcomes always survive a long interval.
+    left, right = 0, len(activity) - 1
+    while left <= right and remaining > 0:
+        for index in dict.fromkeys((left, right)):
+            entry = dict(activity[index])
+            cost = len(evidence_text(entry))
+            allowance = min(2000, remaining)
+            if cost > allowance:
+                overhead = cost - len(str(entry.get("snippet") or ""))
+                original = str(entry.get("snippet") or "")
+                shown = original[: max(0, allowance - overhead - 38)]
+                entry["snippet"] = shown + " [text omitted; see interval artifact]"
+                coverage["truncated_record_count"] += 1
+                coverage["truncated_records"].append(
+                    {
+                        "ordinal": index + 1,
+                        "source_ref": entry.get("source_ref"),
+                        "omitted_text_chars": len(original) - len(shown),
+                    }
+                )
+            chosen[index] = entry
+            remaining -= len(evidence_text(entry))
+            if remaining <= 0:
+                break
+        left += 1
+        right -= 1
+    omitted = [index for index in range(len(activity)) if index not in chosen]
+    ranges = []
+    for index in omitted:
+        if ranges and ranges[-1]["end_ordinal"] == index:
+            ranges[-1]["end_ordinal"] = index + 1
+            ranges[-1]["end_ref"] = activity[index].get("openable_target")
+        else:
+            ranges.append(
+                {
+                    "start_ordinal": index + 1,
+                    "end_ordinal": index + 1,
+                    "start_ref": activity[index].get("openable_target"),
+                    "end_ref": activity[index].get("openable_target"),
+                }
+            )
+    coverage.update(
+        complete=False,
+        displayed_record_count=len(chosen),
+        omitted_record_count=len(omitted),
+        omitted_ranges=ranges,
+    )
+    coverage["omitted_text_char_count"] = sum(
+        len(str(activity[index].get("snippet") or "")) for index in omitted
+    ) + sum(row["omitted_text_chars"] for row in coverage["truncated_records"])
+    try:
+        report_output = getattr(args, "report_output", None)
+        root = (
+            Path(report_output).expanduser().parent
+            if report_output
+            else Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+            / "jsonl-history-search"
+            / "interval-evidence"
+        )
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="interval-",
+            suffix=".txt",
+            dir=root,
+            delete=False,
+        ) as handle:
+            handle.write(
+                "Chronological interval evidence (read source scope only; see command coverage for missing sources).\n\n"
+                + full_text
+            )
+            coverage["artifact_path"] = str(Path(handle.name).resolve())
+    except OSError as exc:
+        coverage["artifact_error"] = (
+            f"Could not write full interval evidence artifact: {exc}"
+        )
+    return [chosen[index] for index in sorted(chosen)], coverage
 
 
 def _answer_text(*, selected: dict, interval: dict, recap_items: list[str], answer_status: str) -> str:
@@ -676,7 +991,7 @@ def _answer_refs(selected: dict, interval: dict, activity: list[dict]) -> list[d
                 "target_source_role": "human_user_message",
             }
         )
-    for entry in activity[:DIRECT_RECAP_ITEM_CAP]:
+    for entry in activity:
         refs.append(
             {
                 "target": entry.get("openable_target") or entry.get("source_ref"),
@@ -686,8 +1001,12 @@ def _answer_refs(selected: dict, interval: dict, activity: list[dict]) -> list[d
                 "target_source_role": entry.get("classification"),
             }
         )
-    boundary = interval.get("boundary") if isinstance(interval.get("boundary"), dict) else {}
-    if boundary.get("source_ref") and all(item.get("source_ref") != boundary.get("source_ref") for item in refs):
+    boundary = (
+        interval.get("boundary") if isinstance(interval.get("boundary"), dict) else {}
+    )
+    if boundary.get("source_ref") and all(
+        item.get("source_ref") != boundary.get("source_ref") for item in refs
+    ):
         refs.append(
             {
                 "target": boundary.get("openable_target") or boundary.get("source_ref"),
@@ -838,13 +1157,27 @@ def _provider_root_status(provider: str, root: Path) -> tuple[bool, str]:
 
 
 def _select_direct_provider(args: Any, *, cwd: Path) -> str:
+    configured = [
+        spec.name for spec in PROVIDERS if getattr(args, spec.root_from_args, None)
+    ]
+    available = [
+        name
+        for name in configured
+        if resolve_provider_root(args, provider=name, cwd=cwd).exists()
+    ]
+    if available:
+        return available[0]
+    if len(configured) == 1:
+        return configured[0]
     explicit_codex = bool(getattr(args, "codex_home", None))
     explicit_claude = bool(getattr(args, "claude_home", None))
     if explicit_claude and not explicit_codex:
         return "claude"
     if explicit_codex and not explicit_claude:
         return "codex"
-    if os.environ.get("CLAUDE_SESSION_ID") and not (os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")):
+    if os.environ.get("CLAUDE_SESSION_ID") and not (
+        os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")
+    ):
         return "claude"
     if os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID"):
         return "codex"
@@ -873,15 +1206,20 @@ def _build_claude_direct_history_answer(
     max_bytes = max(0, int(getattr(args, "max_bytes", 100 * 1024 * 1024) or 0))
     warnings: list[str] = []
     scan_state: dict[str, Any] = {}
-    paths = _bounded_session_paths(
-        search_root,
-        limit=max_files,
-        deadline=deadline,
-        warnings=warnings,
-        scan_state=scan_state,
-    ) if search_root.is_dir() else []
+    paths = (
+        _bounded_session_paths(
+            search_root,
+            limit=max_files,
+            deadline=deadline,
+            warnings=warnings,
+            scan_state=scan_state,
+        )
+        if search_root.is_dir()
+        else []
+    )
     bytes_read = 0
     matching: list[dict] = []
+    reads: list[IntervalRead] = []
     capped = bool(warnings)
     for path in paths:
         if time.monotonic() >= deadline:
@@ -890,26 +1228,40 @@ def _build_claude_direct_history_answer(
             break
         try:
             size = path.stat().st_size
-        except OSError:
+        except OSError as exc:
+            warnings.append(f"Could not stat selected Claude source {path}: {exc}")
             continue
         if bytes_read + size > max_bytes:
             capped = True
             warnings.append("Stopped Claude history reads at max byte cap.")
             break
-        bytes_read += size
-        turns = _read_claude_turns(path, deadline=deadline)
-        if turns is None:
-            capped = True
-            warnings.append("Stopped within a Claude JSONL read at max elapsed cap.")
-            break
-        query_indexes = [index for index, turn in enumerate(turns) if turn["role"] == "user" and _same_text(turn["text"], query)]
+        read = _read_claude_turns(
+            path, deadline=deadline, max_bytes=max_bytes - bytes_read
+        )
+        reads.append(read)
+        bytes_read += read.bytes_read
+        warnings.extend(read.warnings)
+        capped = capped or bool(read.stopped_reason)
+        turns = read.records
+        query_indexes = [
+            index
+            for index, turn in enumerate(turns)
+            if turn["role"] == "user" and _same_text(turn["text"], query)
+        ]
         if not query_indexes:
             continue
         query_index = query_indexes[-1]
         anchors = [turn for turn in turns[:query_index] if turn["role"] == "user"]
         if anchors:
-            matching.append({"path": path, "turns": turns, "query_index": query_index, "anchor": anchors[-1]})
-    if capped:
+            matching.append(
+                {
+                    "path": path,
+                    "turns": turns,
+                    "query_index": query_index,
+                    "anchor": anchors[-1],
+                }
+            )
+    if capped and not matching:
         selection = {
             "status": "partial",
             "reason": "claude_history_scan_stopped_at_explicit_byte_or_elapsed_cap",
@@ -921,73 +1273,183 @@ def _build_claude_direct_history_answer(
             },
             "recovery": "bounded_claude_history_scan_stopped_at_cap",
         }
-        return {"ask_answer": _boundary_answer(query=query, cwd=cwd, route=route, selection=selection, inventory=inventory, limits=limits)}
+        return {
+            "ask_answer": _boundary_answer(
+                query=query,
+                cwd=cwd,
+                route=route,
+                selection=selection,
+                inventory=inventory,
+                limits=limits,
+            )
+        }
     if len(matching) != 1:
         selection = {
             "status": "ambiguous" if len(matching) > 1 else "not_found",
-            "reason": "multiple_claude_query_boundaries" if len(matching) > 1 else "claude_query_boundary_or_prior_human_turn_not_found",
+            "reason": "multiple_claude_query_boundaries"
+            if len(matching) > 1
+            else "claude_query_boundary_or_prior_human_turn_not_found",
             "boundary": {"root": str(search_root), "matching_files": len(matching)},
-            "candidate_refs": [f"{item['path']}:{item['anchor']['line']}" for item in matching[:8]],
+            "candidate_refs": [
+                f"{item['path']}:{item['anchor']['line']}" for item in matching[:8]
+            ],
             "recovery": "bounded_claude_same_root_scan_exhausted",
         }
-        return {"ask_answer": _boundary_answer(query=query, cwd=cwd, route=route, selection=selection, inventory=inventory, limits=limits)}
+        return {
+            "ask_answer": _boundary_answer(
+                query=query,
+                cwd=cwd,
+                route=route,
+                selection=selection,
+                inventory=inventory,
+                limits=limits,
+            )
+        }
     match = matching[0]
     anchor = match["anchor"]
     query_turn = match["turns"][match["query_index"]]
-    activity = [turn for turn in match["turns"] if anchor["line"] < turn["line"] < query_turn["line"]]
+    activity = [
+        {
+            "timestamp_utc": turn.get("timestamp"),
+            "activity_kind": f"{turn['role']}_message",
+            "classification": turn["role"],
+            "snippet": turn["text"],
+            "source_ref": f"{match['path']}:{turn['line']}",
+            "openable_target": f"{match['path']}:{turn['line']}",
+        }
+        for turn in match["turns"]
+        if anchor["line"] < turn["line"] < query_turn["line"]
+    ]
     anchor_ref = f"{match['path']}:{anchor['line']}"
-    refs = [{"target": f"{match['path']}:{anchor['line']}", "source_ref": anchor_ref, "kind": "selected_main_human_anchor", "proof_surface": "primary_raw_history", "target_source_role": "human_user_message"}]
-    recap = []
-    for turn in activity[:DIRECT_RECAP_ITEM_CAP]:
-        ref = f"{match['path']}:{turn['line']}"
-        refs.append({"target": f"{match['path']}:{turn['line']}", "source_ref": ref, "kind": f"{turn['role']}_message", "proof_surface": "primary_raw_session_interval", "target_source_role": turn["role"]})
-        recap.append(f"{turn['role']} message: {turn['text']}")
-    public_anchor = {"source_ref": anchor_ref, "openable_target": f"{match['path']}:{anchor['line']}", "timestamp_utc": anchor.get("timestamp"), "snippet": anchor["text"], "source_kind": "claude_projects"}
-    coverage = {"status": "complete", "complete": True, "records_after_anchor": len(activity), "warnings": []}
+    refs = [
+        {
+            "target": f"{match['path']}:{anchor['line']}",
+            "source_ref": anchor_ref,
+            "kind": "selected_main_human_anchor",
+            "proof_surface": "primary_raw_history",
+            "target_source_role": "human_user_message",
+        }
+    ]
+    preview, output_coverage = _present_interval(activity, args=args)
+    recap = _recap_items(preview)
+    for turn in preview:
+        refs.append(
+            {
+                "target": turn["openable_target"],
+                "source_ref": turn["source_ref"],
+                "kind": turn["activity_kind"],
+                "proof_surface": "primary_raw_session_interval",
+                "target_source_role": turn["classification"],
+            }
+        )
+    public_anchor = {
+        "source_ref": anchor_ref,
+        "openable_target": f"{match['path']}:{anchor['line']}",
+        "timestamp_utc": anchor.get("timestamp"),
+        "snippet": anchor["text"],
+        "source_kind": "claude_projects",
+    }
+    coverage = _interval_coverage(
+        reads=reads,
+        warnings=warnings,
+        scan_state=scan_state,
+        selected_count=len(paths),
+        inspected=len(reads),
+        record_count=len(activity),
+    )
+    answer_status = "answered-from-proof" if coverage["complete"] else "partial"
+    if output_coverage.get("artifact_error"):
+        answer_status = "partial"
     contract = {
-        "built_from": "direct_history_answer", "answer_action_status": "answered-from-proof",
+        "built_from": "direct_history_answer",
+        "answer_action_status": answer_status,
         "promotion_status": "direct_lineage_chronology_and_bounded_interval",
         "selection_policy": "provider_native_session_chronology; no semantic ranking",
         "anchor": public_anchor,
-        "searched_interval": {"anchor": public_anchor, "boundary": {"source_ref": f"{match['path']}:{query_turn['line']}", "timestamp_utc": query_turn.get("timestamp")}, "chronological_entry_count": len(activity)},
-        "coverage": coverage, "missing_or_capped_scope": _missing_or_capped_scope({}, coverage),
-        "source_inventory": inventory, "limits": limits,
+        "searched_interval": {
+            "anchor": public_anchor,
+            "boundary": {
+                "source_ref": f"{match['path']}:{query_turn['line']}",
+                "timestamp_utc": query_turn.get("timestamp"),
+            },
+            "chronological_entry_count": len(activity),
+        },
+        "coverage": coverage,
+        "missing_or_capped_scope": _missing_or_capped_scope({}, coverage),
+        "output_coverage": output_coverage,
+        "source_inventory": inventory,
+        "limits": limits,
         "native_source_refs": [item["source_ref"] for item in refs],
-        "visible_context_used_as_proof": False, "legacy_packet_or_execute_continuation_used": False,
+        "visible_context_used_as_proof": False,
+        "legacy_packet_or_execute_continuation_used": False,
     }
-    answer = _answer_text(selected=public_anchor, interval=contract["searched_interval"], recap_items=recap, answer_status="answered-from-proof")
-    return {"ask_answer": {"schema_version": "direct_history_answer.v1", "query": query, "cwd": str(cwd), "selected_route": route, "execution": {"status": "executed", "command_family": "direct-history-answer", "internal_recovery": "bounded_claude_same_file_chronology"}, "answer_status": "answered-from-proof", "answer": answer, "refs_used": refs, "proof_summary": recap, "fail_closed_reason": None, "next_proof_step": None, "source_role_explanation": None, "source_contract": contract}}
+    answer = _answer_text(
+        selected=public_anchor,
+        interval=contract["searched_interval"],
+        recap_items=recap,
+        answer_status=answer_status,
+    )
+    if not output_coverage["complete"]:
+        answer = "Bounded evidence preview. " + answer
+    return {
+        "ask_answer": {
+            "schema_version": "direct_history_answer.v1",
+            "query": query,
+            "cwd": str(cwd),
+            "selected_route": route,
+            "execution": {
+                "status": "executed",
+                "command_family": "direct-history-answer",
+                "internal_recovery": "bounded_claude_same_file_chronology",
+            },
+            "answer_status": answer_status,
+            "answer": answer,
+            "refs_used": refs,
+            "proof_summary": recap,
+            "fail_closed_reason": None
+            if coverage["complete"]
+            else "Selected source coverage is partial.",
+            "next_proof_step": None,
+            "source_role_explanation": None,
+            "source_contract": contract,
+        }
+    }
 
 
-def _read_claude_turns(path: Path, *, deadline: float) -> list[dict] | None:
+def _read_claude_turns(path: Path, *, deadline: float, max_bytes: int) -> IntervalRead:
+    result = _read_interval_rows(path, deadline=deadline, max_bytes=max_bytes)
     turns: list[dict] = []
-    try:
-        handle = path.open("r", encoding="utf-8", errors="replace")
-    except OSError:
-        return turns
-    with handle:
-        for line_number, line in enumerate(handle, 1):
-            if time.monotonic() >= deadline:
-                return None
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(record, Mapping):
-                continue
-            message = record.get("message") if isinstance(record.get("message"), Mapping) else record
-            role = str(message.get("role") or record.get("type") or "").casefold()
-            if role not in {"user", "assistant"}:
-                continue
-            content = message.get("content")
-            if isinstance(content, list):
-                text = " ".join(str(item.get("text") or "") for item in content if isinstance(item, Mapping))
-            else:
-                text = str(content or message.get("text") or "")
-            text = " ".join(text.split())
-            if text:
-                turns.append({"role": role, "text": text, "timestamp": record.get("timestamp"), "line": line_number})
-    return turns
+    for row in result.records:
+        line_number, record = row["line"], row["raw"]
+        message = (
+            record.get("message")
+            if isinstance(record.get("message"), Mapping)
+            else record
+        )
+        role = str(message.get("role") or record.get("type") or "").casefold()
+        if role not in {"user", "assistant"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            text = " ".join(
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, Mapping)
+            )
+        else:
+            text = str(content or message.get("text") or "")
+        text = " ".join(text.split())
+        if text:
+            turns.append(
+                {
+                    "role": role,
+                    "text": text,
+                    "timestamp": record.get("timestamp"),
+                    "line": line_number,
+                }
+            )
+    result.records = turns
+    return result
 
 
 def _same_text(left: str, right: str) -> bool:

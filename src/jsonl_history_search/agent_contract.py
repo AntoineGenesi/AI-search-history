@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .source_refs import evidence_ref, evidence_identity, ref_target
+
 import json
 import re
 import shlex
@@ -7,7 +9,6 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from .adapters import AdapterReadError, iter_records_for_file
@@ -3049,11 +3050,7 @@ def build_candidate_rows(search_result: dict) -> list[CandidateRow]:
                     rank=0,
                     candidate_id="",
                     source_ref=canonical_source_ref(
-                        {
-                            "path": match.get("path") or "",
-                            "line": int(match.get("line") or 0),
-                            "session": match.get("session") or group.get("session"),
-                        }
+                        evidence_ref(match, session=group.get("session"))
                     ),
                     path=match.get("path") or "",
                     line=int(match.get("line") or 0),
@@ -4410,7 +4407,7 @@ def dedupe_evidence_packet_context_children(children: list[dict[str, Any]]) -> l
     seen: set[tuple[str, str]] = set()
     for child in children:
         source_ref = child.get("source_ref") if isinstance(child.get("source_ref"), dict) else {}
-        key = (str(source_ref.get("path") or ""), str(source_ref.get("line") or ""))
+        key = evidence_identity(source_ref)
         if key in seen:
             continue
         seen.add(key)
@@ -4761,6 +4758,16 @@ def materialize_evidence_packet_context(
                 "counts": materialized_context_counts(requested_count=requested_count, omitted_or_truncated_count=requested_count),
             }
 
+    native_children = [ref for ref in child_refs if ref.get("native_ref")]
+    if native_children:
+        child_lines = []
+        for ref in native_children:
+            positions = [index + 1 for index, record in enumerate(records)
+                         if evidence_identity(record) == evidence_identity(ref)]
+            if len(positions) != 1:
+                return {**base, "status": "ambiguous_native_ref" if positions else "native_ref_not_found",
+                        "counts": materialized_context_counts(omitted_or_truncated_count=len(child_refs))}
+            child_lines.append(positions[0])
     total_records = len(records)
     requested_lines = sorted(
         {
@@ -4777,7 +4784,8 @@ def materialize_evidence_packet_context(
     unavailable_before_count = sum(max(0, evidence_context_window - (child_line - 1)) for child_line in child_lines)
     unavailable_after_count = sum(max(0, child_line + evidence_context_window - total_records) for child_line in child_lines)
     child_line_set = set(child_lines)
-    record_by_line = {int(record.line): record for record in records}
+    record_by_line = ({index + 1: record for index, record in enumerate(records)} if native_children
+                      else {int(record.line): record for record in records})
     packet_chars_remaining = min(
         EVIDENCE_PACKET_MATERIALIZED_CONTEXT_PACKET_CHAR_LIMIT,
         max(0, int(total_chars_remaining or 0)),
@@ -4812,9 +4820,9 @@ def materialize_evidence_packet_context(
     return {
         **base,
         "status": "materialized" if materialized_records else "no_records_materialized",
-        "source_ref": {"path": str(source_path), "line": child_lines[0]},
+        "source_ref": canonical_source_ref(child_refs[0]),
         "source_order_preserved": True,
-        "dedupe_key": "source_ref.line",
+        "dedupe_key": "native_ref" if native_children else "source_ref.line",
         "window_bounds": {
             "requested_child_lines": child_lines,
             "requested_line_start": requested_lines[0] if requested_lines else None,
@@ -4962,22 +4970,8 @@ def evidence_context_records_from_fielded_cache(
 
 
 def evidence_context_record_from_cached_payload(payload: dict[str, Any], *, source_path: Path) -> Any:
-    timestamp = None
-    raw_timestamp = payload.get("timestamp")
-    if isinstance(raw_timestamp, str) and raw_timestamp:
-        try:
-            timestamp = datetime.fromisoformat(raw_timestamp)
-        except ValueError:
-            timestamp = None
-    return SimpleNamespace(
-        path=str(source_path),
-        line=int(payload.get("line") or 1),
-        role=str(payload.get("role") or ""),
-        text=str(payload.get("text") or ""),
-        timestamp=timestamp,
-        cwd=str(payload.get("cwd")) if payload.get("cwd") else None,
-        raw_timestamp=str(payload.get("raw_timestamp")) if payload.get("raw_timestamp") else None,
-    )
+    from .fielded_bm25 import _record_from_persistent_payload
+    return _record_from_persistent_payload(payload, path=source_path)
 
 
 def evidence_context_record_from_raw_line(
@@ -5001,13 +4995,8 @@ def materialized_context_record(record: Any, *, hit_child: bool, char_limit: int
     if truncated:
         text = text[:limit]
     return {
-        "source_ref": canonical_source_ref(
-            {
-                "path": str(record.path),
-                "line": int(record.line),
-            }
-        ),
-        "target": f"{record.path}:{record.line}",
+        "source_ref": canonical_source_ref(evidence_ref(record)),
+        "target": source_ref_target(evidence_ref(record)),
         "line": int(record.line),
         "role": record.role,
         "timestamp": record.raw_timestamp,
@@ -6315,6 +6304,8 @@ def context_action(
 
 
 def source_ref_target(source_ref: dict[str, Any]) -> str | None:
+    if source_ref.get("native_ref"):
+        return ref_target(source_ref)
     path = source_ref.get("path")
     line = normalized_source_ref_line(source_ref.get("line"))
     if path and line:
@@ -6352,6 +6343,9 @@ def canonical_source_ref(source_ref: dict[str, Any] | None) -> dict[str, Any]:
     session = ref.get("session")
     if session not in (None, ""):
         canonical["session"] = str(session)
+    for key in ("native_ref", "provider", "native_id"):
+        if ref.get(key):
+            canonical[key] = str(ref[key])
     return canonical
 
 

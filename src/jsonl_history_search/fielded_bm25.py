@@ -17,6 +17,7 @@ from .profiling import finish_phase_profile, start_phase_profile
 from .query import QueryIntent
 from .ranking import Match, group_matches, make_snippet, score_record
 from .records import Record, parse_record
+from .source_refs import evidence_ref, evidence_identity, ref_target
 from .masking import MaskContext
 from .scanner import (
     _init_expected_ref_diagnostics,
@@ -33,7 +34,7 @@ from .tool_events import detect_events_for_record
 FIELDED_BM25_VERSION = "fielded-sqlite-fts5-record-chunk-v1"
 FIELDED_BM25_INDEX_SCHEMA_VERSION = "fielded-bm25-segment-cache-v2"
 FIELDED_BM25_DURABLE_SCHEMA_VERSION = "fielded-bm25-durable-sqlite-fts5-v1"
-FIELDED_BM25_PARSER_VERSION = "jsonl-record-parser-v1"
+FIELDED_BM25_PARSER_VERSION = "jsonl-native-record-parser-v2"
 FTS_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:/-]*", re.IGNORECASE)
 TIMESTAMP_BUCKET_RE = re.compile(r"^(\d{4}-\d{2}(?:-\d{2})?)")
 # Keep JSONL rows as source-record candidates so the FTS LIMIT bounds
@@ -1488,9 +1489,9 @@ def _build_continuation_next_read_recovery(
     candidate_limit: int,
 ) -> dict[str, Any]:
     grouped_rowids = {int(row[0]) for row in grouped_rows}
-    final_lines_by_path: dict[str, set[int]] = {}
+    final_lines_by_path: dict[str, set[Any]] = {}
     for match in final_matches:
-        final_lines_by_path.setdefault(str(match.path), set()).add(int(match.line))
+        final_lines_by_path.setdefault(str(match.path), set()).add(evidence_identity(match)[1] if match.source_ref else int(match.line))
 
     items: list[dict[str, Any]] = []
     bounded_item_limit = max(int(candidate_limit), 0)
@@ -1560,11 +1561,11 @@ def _build_continuation_next_read_recovery(
 
 
 def _live_source_ref(ref: FieldedBm25RecordRef) -> dict[str, Any]:
-    source_ref: dict[str, Any] = {
+    source_ref: dict[str, Any] = evidence_ref(ref.record, session=ref.session_key) if ref.record else {
         "path": ref.path.as_posix(),
         "line": int(ref.line),
     }
-    if ref.session_key:
+    if ref.session_key and "session" not in source_ref:
         source_ref["session"] = ref.session_key
     if ref.day_key:
         source_ref["day"] = ref.day_key
@@ -1574,7 +1575,7 @@ def _live_source_ref(ref: FieldedBm25RecordRef) -> dict[str, Any]:
 
 
 def _live_source_ref_target(source_ref: dict[str, Any]) -> str:
-    return f"{source_ref['path']}:{source_ref['line']}"
+    return ref_target(source_ref) or ""
 
 
 def _build_continuation_candidate_ledger(
@@ -1590,9 +1591,9 @@ def _build_continuation_candidate_ledger(
     materialization: dict[str, int | bool],
 ) -> dict[str, Any]:
     grouped_rowids = {int(row[0]) for row in grouped_rows}
-    final_lines_by_path: dict[str, set[int]] = {}
+    final_lines_by_path: dict[str, set[Any]] = {}
     for match in final_matches:
-        final_lines_by_path.setdefault(str(match.path), set()).add(int(match.line))
+        final_lines_by_path.setdefault(str(match.path), set()).add(evidence_identity(match)[1] if match.source_ref else int(match.line))
     items: list[dict[str, Any]] = []
     recoverable_omitted = 0
     final_present = 0
@@ -1726,17 +1727,19 @@ def _build_continuation_candidate_ledger(
     }
 
 
-def _source_ref_has_final_match(ref: FieldedBm25RecordRef, final_lines_by_path: dict[str, set[int]]) -> bool:
+def _source_ref_has_final_match(ref: FieldedBm25RecordRef, final_lines_by_path: dict[str, set[Any]]) -> bool:
     final_lines = final_lines_by_path.get(str(ref.path))
     if not final_lines:
         return False
+    if ref.record and ref.record.source_ref:
+        return evidence_identity(ref.record)[1] in final_lines
     line_start = int(ref.line)
     line_end = int(ref.line_end or ref.line)
-    return any(line_start <= line <= line_end for line in final_lines)
+    return any(isinstance(line, int) and line_start <= line <= line_end for line in final_lines)
 
 
 def _source_ref_hash(ref: FieldedBm25RecordRef) -> str:
-    basis = f"{ref.source_kind}|{ref.path.as_posix()}|{ref.line}|{ref.line_end or ref.line}"
+    basis = repr(evidence_identity(ref.record)) if ref.record and ref.record.source_ref else f"{ref.source_kind}|{ref.path.as_posix()}|{ref.line}|{ref.line_end or ref.line}"
     return hashlib.sha256(basis.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
@@ -2087,6 +2090,14 @@ def _record_to_persistent_payload(record: Record) -> dict[str, Any]:
         "record_id": record.record_id,
         "parent_id": record.parent_id,
         "conversation_id": record.conversation_id,
+        "provider": record.provider,
+        "native_id": record.native_id,
+        "native_locator": _portable_locator(record.source_ref, source_path=record.path),
+        "supporting_locators": [_portable_locator(ref, source_path=record.path) for ref in record.source_refs or []],
+        "timestamp_quality": record.timestamp_quality,
+        "coverage_notes": list(record.coverage_notes or []),
+        "unsupported_fields": record.unsupported_fields,
+        "lossy_conversions": record.lossy_conversions,
     }
 
 
@@ -2113,7 +2124,33 @@ def _record_from_persistent_payload(payload: dict[str, Any] | None, *, path: Pat
         record_id=str(payload.get("record_id")) if payload.get("record_id") else None,
         parent_id=str(payload.get("parent_id")) if payload.get("parent_id") else None,
         conversation_id=str(payload.get("conversation_id")) if payload.get("conversation_id") else None,
+        provider=payload.get("provider"), native_id=payload.get("native_id"),
+        source_ref=_restore_locator(payload.get("native_locator"), path=path),
+        source_refs=[ref for value in payload.get("supporting_locators") or [] if (ref := _restore_locator(value, path=path))],
+        timestamp_quality=payload.get("timestamp_quality") or "record",
+        coverage_notes=list(payload.get("coverage_notes") or []),
+        unsupported_fields=payload.get("unsupported_fields"), lossy_conversions=payload.get("lossy_conversions"),
     )
+
+
+def _portable_locator(locator: str | None, *, source_path: str) -> dict | None:
+    """Persist suffix/relative support path, restoring the selected live path on load."""
+    if not locator:
+        return None
+    if locator.startswith(source_path):
+        return {"suffix": locator[len(source_path):]}
+    head, marker, tail = locator.partition("#")
+    if marker:
+        import os
+        return {"relative_path": os.path.relpath(head, Path(source_path).parent), "suffix": "#" + tail}
+    return None
+
+
+def _restore_locator(locator: dict | None, *, path: Path) -> str | None:
+    if not isinstance(locator, dict):
+        return None
+    source = path.parent / locator["relative_path"] if locator.get("relative_path") else path
+    return str(source.resolve()) + str(locator.get("suffix") or "")
 
 
 def _valid_persistent_segment(segment: Any, *, metadata: dict[str, Any]) -> bool:
@@ -5759,9 +5796,12 @@ def _materialize_match(
         score=round(score, 3),
         reasons=sorted(set(["fielded_bm25:candidate"] + reasons), key=(["fielded_bm25:candidate"] + reasons).index),
         artifacts=facets.artifacts,
-        session=facets.session,
+        session=record.conversation_id or facets.session,
         tasks=facets.tasks,
         preferences=facets.preferences,
+        provider=record.provider, source_ref=record.source_ref,
+        source_refs=list(record.source_refs or []), native_id=record.native_id,
+        timestamp_quality=record.timestamp_quality, coverage_notes=list(record.coverage_notes or []),
     )
 
 

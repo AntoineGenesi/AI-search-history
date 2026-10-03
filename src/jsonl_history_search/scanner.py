@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .source_refs import evidence_identity
+
 from collections import deque
 from dataclasses import dataclass
 import re
@@ -887,6 +889,8 @@ def dedupe_source_scope(record) -> str:
     source_format = record.source_format or ""
     if source_format in CONTENT_MIRROR_SOURCE_KINDS:
         return "codex_history_session_content_mirror"
+    if record.source_ref:
+        return repr(evidence_identity(record))
     if record.record_id:
         return f"record_id:{source_format}:{record.conversation_id or ''}:{record.record_id}"
     return f"source_ref:{source_format}:{record.path}:{record.line}"
@@ -920,7 +924,7 @@ def _materialize_match(
         score=round(score, 3),
         reasons=reasons,
         artifacts=facets.artifacts,
-        session=facets.session,
+        session=record.conversation_id or facets.session,
         tasks=facets.tasks,
         preferences=facets.preferences,
         provider=record.provider,

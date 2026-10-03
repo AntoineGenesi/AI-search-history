@@ -875,7 +875,7 @@ def render_ask_answer_text(payload: dict) -> str:
     proof = report.get("proof_summary") or []
     if proof:
         lines.append("Proof summary:")
-        for item in proof[:6]:
+        for item in proof:
             lines.append(f"- {item}")
     if report.get("next_proof_step"):
         lines.append(f"Next proof step: {report.get('next_proof_step')}")
@@ -897,6 +897,15 @@ def _append_direct_history_answer_contract_text(lines: list[str], contract: dict
     interval = contract.get("searched_interval") or {}
     coverage = contract.get("coverage") or {}
     missing = contract.get("missing_or_capped_scope") or {}
+    output_coverage = contract.get("output_coverage") or {}
+    if output_coverage:
+        lines.append(f"Displayed evidence: complete={output_coverage.get('complete')} omitted records={output_coverage.get('omitted_record_count', 0)} truncated records={output_coverage.get('truncated_record_count', 0)} omitted text chars={output_coverage.get('omitted_text_char_count', 0)}")
+        if output_coverage.get("omitted_ranges"):
+            lines.append(f"Output omitted ranges: {json.dumps(output_coverage['omitted_ranges'], sort_keys=True)}")
+        if output_coverage.get("artifact_path"):
+            lines.append(f"Full interval evidence artifact (plain text): {output_coverage['artifact_path']}")
+        if output_coverage.get("artifact_error"):
+            lines.append(f"Evidence gap: {output_coverage['artifact_error']}")
     lines.append(
         "Anchor: "
         f"{anchor.get('source_ref') or '(unavailable)'} "
@@ -1111,7 +1120,7 @@ def render_ask_answer_markdown(payload: dict) -> str:
     proof = report.get("proof_summary") or []
     if proof:
         lines.extend(["", "## Proof Summary"])
-        for item in proof[:6]:
+        for item in proof:
             lines.append(f"- {item}")
     if report.get("next_proof_step"):
         lines.extend(["", "## Next Proof Step", "", f"`{report.get('next_proof_step')}`"])
