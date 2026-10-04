@@ -19,6 +19,7 @@ from .conversation_records import (ASSISTANT_OR_AGENT_MESSAGE, COMPACTED_HISTORY
     INJECTED_ENVIRONMENT_CONTEXT, SUBAGENT_NOTIFICATION, TURN_CONTROL_OR_STATUS,
     classify_conversation_record)
 from .history_evidence import TEXT_LIMIT, RESPONSE_LIMIT, RETAIN_LIMIT
+from .native_observations import NativeOrigin, native_metadata_identity
 from .records import text_from_item, native_message_payload
 from .source_refs import evidence_ref
 from .sources import cap_labels_from_warnings, enumerate_jsonl_files, source_kind_for_path
@@ -85,22 +86,7 @@ class NativeSession:
     request_boundary: dict | None = None
     boundary_complete: bool = True
     parent_conflict: bool = False
-
-
-def native_metadata_identity(body):
-    owners = {body[k] for k in ('id', 'session_id') if isinstance(body.get(k), str) and body[k]}
-    if len(owners) != 1:
-        raise ValueError('native owning session identity missing or conflicting')
-    source = body.get('source')
-    subagent = source.get('subagent') if isinstance(source, dict) else None
-    spawn = subagent.get('thread_spawn') if isinstance(subagent, dict) else None
-    edges = [body.get('parent_thread_id'), body.get('parent_session_id')]
-    if isinstance(spawn, dict):
-        edges.append(spawn.get('parent_thread_id'))
-    present = [e for e in edges if e is not None]
-    conflict = any(not isinstance(e, str) or not e for e in present) or len(set(e for e in present if isinstance(e, str))) > 1
-    worker = body.get('thread_source') == 'subagent' or (isinstance(source, dict) and 'subagent' in source) or body.get('agent_role') in {'worker', 'reviewer'}
-    return next(iter(owners)), worker, present[0] if present and not conflict else None, conflict
+    native_origin: object = None
 
 
 class NativeTargetIntegrityError(ValueError):
@@ -155,8 +141,9 @@ def resolve_request_boundary(state, request_turn, live_request):
         return
     turn = candidate['turn']
     closed = bool(candidate.get('terminal_ref'))
-    explicit = bool(request_turn and turn == request_turn and not closed and not state.turn_conflict)
-    inferred = bool(live_request and state.complete and turn and state.open_turn == turn
+    attributable = candidate['anchor'].get('authorship') != 'uncertain'
+    explicit = bool(attributable and request_turn and turn == request_turn and not closed and not state.turn_conflict)
+    inferred = bool(attributable and live_request and state.complete and turn and state.open_turn == turn
                     and state.open_turn_ref and not state.turn_conflict)
     state.request_boundary = {'request_ref': candidate['anchor']['source_ref'],
         'mirror_lines': candidate['anchor'].get('native_mirror_lines', []),
@@ -194,6 +181,20 @@ def resolve_request_boundary(state, request_turn, live_request):
             for field in ('after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped'):
                 setattr(state, field, getattr(state, field) + prior[field])
     state.previous_interval = None
+
+
+def finalize_native_attribution(state):
+    """Canonical file identity is not proof of mixed legacy record authorship."""
+    origin = state.native_origin
+    if not origin or not origin.mixed:
+        return
+    anchors = [state.anchor,
+        state.previous_interval.get('anchor') if state.previous_interval else None,
+        state.request_candidate.get('anchor') if state.request_candidate else None]
+    for anchor in anchors:
+        if anchor and not anchor.get('own_history_proven'):
+            anchor['authorship'] = 'uncertain'
+            state.boundary_complete = False
 
 
 def excerpt(record, *, kind, mask_context, text=None, limit=4096):
@@ -245,6 +246,19 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                  retained_limit, request_session, request_turn, query, live_request, expected_identity=None):
     if not state.path.stat().st_mode & 0o444:
         raise PermissionError('source has no read permission bits')
+    native_origin = NativeOrigin()
+    state.native_origin = native_origin
+
+    def segment_boundary():
+        state.pending.clear()
+        if state.previous_interval:
+            state.previous_interval['pending'].clear()
+        state.current_turn, state.open_turn, state.open_turn_ref = None, None, None
+        state.last_transport = None
+        # A request occurrence cannot borrow lifecycle evidence across headers.
+        if state.request_candidate:
+            state.turn_conflict = True
+
     for record in iter_records_for_file(state.path, kind, default_tz,
             raw_line_stats=stats, budget=budget, budget_phase='chronology'):
         state.records += 1
@@ -253,7 +267,10 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if not isinstance(body, dict):
             continue
         top, event = raw.get('type'), body.get('type', raw.get('type'))
-        if raw.get('inherited') or body.get('inherited') or body.get('is_replay'):
+        if raw.get('inherited') or body.get('inherited') or raw.get('is_replay') or body.get('is_replay'):
+            if native_origin.owner:
+                native_origin.snapshot(raw.get('ordinal'), raw, evidence_ref(record))
+            segment_boundary()
             state.controls += 1
             continue
         claude = 'sessionId' in raw and top in {'user', 'assistant'}
@@ -269,15 +286,18 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                 raise NativeTargetIntegrityError('changed Claude native owning metadata')
             if not state.session:
                 state.session, state.worker, state.cwd = owner, raw['isSidechain'], raw.get('cwd')
-        if state.session and body.get('thread_id') and str(body['thread_id']) != state.session:
-            raise (NativeTargetIntegrityError if expected_identity else ValueError)('native event thread conflicts with owning session')
         if top == 'session_meta':
             try:
                 owner, worker, parent, conflict = native_metadata_identity(body)
+                _, first = native_origin.metadata(body, evidence_ref(record), raw.get('ordinal'))
             except ValueError as exc:
                 raise (NativeTargetIntegrityError if expected_identity else ValueError)(str(exc))
-            if expected_identity and (owner, worker, parent, conflict) != expected_identity:
+            if expected_identity and first and (owner, worker, parent, conflict) != expected_identity:
                 raise NativeTargetIntegrityError('changed native owning metadata')
+            if not first:
+                segment_boundary()
+                state.controls += 1
+                continue
             if state.session:
                 if owner != state.session or worker != state.worker:
                     raise (NativeTargetIntegrityError if expected_identity else ValueError)('conflicting native session ownership metadata')
@@ -291,6 +311,15 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             continue
         if expected_identity and not state.session:
             raise NativeTargetIntegrityError('selected body owning metadata unavailable')
+        origin = native_origin.snapshot(raw.get('ordinal'), raw, evidence_ref(record)) if native_origin.owner else None
+        if origin and origin['authorship'] != 'own':
+            # Copied model context is not this session's genuine human boundary.
+            segment_boundary()
+            state.controls += 1
+            state.boundary_complete = state.boundary_complete and origin['authorship'] == 'inherited'
+            continue
+        if state.session and body.get('thread_id') and str(body['thread_id']) != state.session:
+            raise (NativeTargetIntegrityError if expected_identity else ValueError)('native event thread conflicts with owning session')
         timestamp = record.timestamp.astimezone(timezone.utc) if record.timestamp else None
         if timestamp and state.last_time and timestamp < state.last_time:
             state.temporal_complete = False
@@ -411,6 +440,8 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             # Native record order defines the latest eligible turn; reversed or
             # untimed rows retain their explicit temporal uncertainty.
             state.anchor = excerpt(record, kind='human_message_start', mask_context=mask_context)
+            if origin and origin['own_history_proven']:
+                state.anchor['own_history_proven'] = True
             state.anchor_time = timestamp
             state.request_candidate = {'anchor': state.anchor, 'turn': native_turn,
                 'start_ref': state.open_turn_ref if state.open_turn == native_turn else None} if candidate else None
@@ -659,7 +690,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     cutoff = cutoff.astimezone(timezone.utc)
     files = list(enumerate_jsonl_files(plan, budget=budget, measured_byte_admission=True))
     states, errors, stats = [], [], RawLineScanStats()
-    request_session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_SESSION_ID')
+    request_session = os.environ.get('CODEX_THREAD_ID')
     request_turn = os.environ.get('CODEX_TURN_ID')
     discovery_errors, metadata = [], []
     target, target_scope = None, None
@@ -710,7 +741,9 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         except (OSError, ValueError, TypeError) as exc:
             errors.append({'path': str(path), 'reason': str(exc)})
         finally:
+            finalize_native_attribution(state)
             resolve_request_boundary(state, request_turn, live_request)
+            finalize_native_attribution(state)
         if state.parent_conflict:
             errors.append({'path': str(path), 'reason': 'conflicting native direct-parent metadata'})
         if not budget.available('chronology'):
