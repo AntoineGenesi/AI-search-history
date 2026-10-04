@@ -362,7 +362,7 @@ def display_entries(entries, allowance, contexts, path):
         for item in ordered:
             text = item['text']
             spans = [{'text_byte_start': 0, 'text_byte_end': len(text.encode()), 'text': text}]
-            if item.get('outcome_spans'):
+            if item.get('outcome_spans') and (not item['text_complete'] or len(text.encode()) + 1 > remaining):
                 # Keep original text offsets. Never move disposition lines under
                 # a different source, or present a synthetic contiguous passage.
                 spans = []
