@@ -24,8 +24,10 @@ chronological tool outcomes. Read chronology.scope and anchor: a selected sessio
 does not prove its relationship to a requesting side thread. Parent identity
 requires a native parent edge. Never infer a human anchor from lexical rank.
 Source scan, retained interval and display completeness are separate. Open the
-returned readable interval_artifact for concrete display gaps; its source_path
-header binds each excerpt's native line. Preserve failures and unfinished work.
+returned readable interval_artifact only for concrete display gaps; its source_path
+header binds each excerpt's native line. Read bounded relevant excerpts, not the
+whole retained interval: retention is not extra copied-text allowance. Preserve
+failures and unfinished work, and name remaining gaps.
 
 Summarize supported facts even when coverage is partial, and name the reported
 missing roots, source errors, weak timestamps, caps and passage omissions.
