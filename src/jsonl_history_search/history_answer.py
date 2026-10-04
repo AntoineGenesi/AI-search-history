@@ -23,6 +23,8 @@ from .records import text_from_item, native_message_payload
 from .source_refs import evidence_ref
 from .sources import cap_labels_from_warnings, enumerate_jsonl_files, source_kind_for_path
 
+REPORT_LIMIT = 393216
+
 
 def is_direct_latest_message_history_query(query):
     text = ' '.join(query.lower().split())
@@ -79,6 +81,10 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
         'timestamp_quality': record.timestamp_quality, 'kind': kind,
         'speaker': 'assistant' if kind == 'reported_claim' else 'tool' if kind.startswith('tool_') else 'user',
         'text': clip(text, limit), 'text_complete': original <= limit, 'original_text_bytes': original}
+    body = native_message_payload(record.raw or {})
+    for source, target in (('channel', 'native_channel'), ('sender', 'native_origin'), ('name', 'tool_name')):
+        if isinstance(body, dict) and isinstance(body.get(source), str):
+            result[target] = clip(body[source], 256)
     if kind == 'tool_result':
         # Exact returned process/git disposition lines may occur anywhere in a
         # long output; retain byte offsets, not an invented outcome summary.
@@ -188,6 +194,8 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                     value = str(item.get('name') or '') + ' ' + json.dumps(item.get('input'), ensure_ascii=False) if invocation else text_from_item(item.get('content'))
                     entry = excerpt(record, kind='tool_invocation' if invocation else 'tool_result', mask_context=mask_context, text=value)
                     entry['source_ref']['content_index'] = index
+                    if invocation and isinstance(item.get('name'), str):
+                        entry['tool_name'] = clip(item['name'], 256)
                     raw_call = str((item.get('id') if invocation else item.get('tool_use_id')) or '')
                     call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
                     entry['call_id'] = call or None
@@ -281,7 +289,101 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
     state.complete = True
 
 
-def retain_interval(entries, anchor, *, cutoff, omissions):
+def report_ref(ref):
+    return 'L%s%s' % (ref['line'], '[content %s]' % ref['content_index'] if 'content_index' in ref else '')
+
+
+def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_complete,
+                      temporal_complete, pending, masked, budget):
+    """One structural union, serialized once; no topic ranking or source reread."""
+    def key(ref):
+        return ref['line'], ref.get('content_index', -1)
+    calls = {key(e['source_ref']): e for e in entries if e['kind'] == 'tool_invocation'}
+    selected = {}
+    classes = {}
+    unresolved = {key(e['source_ref']) for e in pending.values()}
+    for entry in entries:
+        budget.check('chronology_report')
+        classes[entry['kind']] = classes.get(entry['kind'], 0) + 1
+        brief = entry['kind'] == 'tool_result' and entry['text_complete'] and len(entry['text'].encode()) <= 512
+        if entry['kind'] == 'reported_claim' or brief or entry.get('outcome_spans'):
+            selected[key(entry['source_ref'])] = entry
+            if entry.get('invocation_ref'):
+                ref = entry['invocation_ref']
+                selected[key(ref)] = calls.get(key(ref), {'source_ref': ref, 'kind': 'tool_invocation', 'text': '', 'text_complete': False})
+    for ref in unresolved:
+        if ref in calls:
+            selected[ref] = calls[ref]
+        else:
+            selected[ref] = {'source_ref': {'line': ref[0], **({'content_index': ref[1]} if ref[1] >= 0 else {})}, 'kind': 'tool_invocation', 'text': '', 'text_complete': False}
+    header = ('BOUNDED NATIVE CHRONOLOGY REPORT\nSource: %s\nScope: %s; parent verified: %s\n'
+        'Human boundary: %s\n%s\nCutoff: %s\nSource complete: %s; temporal complete: %s\n'
+        'Retention omissions: %s\nMasking enabled: %s\n'
+        'L123 denotes this source line 123; content indices identify native message parts. Native order, not timestamp rank.\n'
+        'ASSISTANT REPORT is unverified narrative; RETURNED OUTPUT is actual returned text. Native channel/origin/tool name unknown unless shown.\n'
+        'Invocation preview limited to already-complete text <=256 bytes. Invocation arguments omitted: clipped or longer; refs do not prove unseen arguments.\n'
+        'Projection: all retained reports, existing disposition spans, every complete result <=512 bytes, paired and unresolved invocation refs. Child activity not established complete.\n\n') % (
+            anchor['source_ref']['path'], scope, scope == 'proven_parent', report_ref(anchor['source_ref']),
+            anchor['text'], cutoff.isoformat(), source_complete, temporal_complete,
+            json.dumps(omissions, separators=(',', ':')), bool(masked))
+    blocks, emitted_classes = [], {}
+    for ref, entry in sorted(selected.items()):
+        budget.check('chronology_report')
+        kind = entry['kind']
+        label = 'ASSISTANT REPORT' if kind == 'reported_claim' else 'RETURNED OUTPUT' if kind == 'tool_result' else 'UNRESOLVED INVOCATION' if ref in unresolved else 'INVOCATION'
+        fields = [report_ref(entry['source_ref']), label]
+        for field in ('native_channel', 'native_origin', 'tool_name'):
+            if entry.get(field):
+                fields.append('%s=%s' % (field, entry[field]))
+        if kind == 'tool_result':
+            fields.append('invocation ' + report_ref(entry['invocation_ref']) if entry.get('invocation_ref') else 'association unavailable')
+        if entry.get('native_mirror_lines'):
+            fields.append('mirrors ' + ','.join('L%s' % n for n in entry['native_mirror_lines']))
+        text = entry.get('text', '')
+        if kind == 'tool_invocation':
+            text = text if entry.get('text_complete') and len(text.encode()) <= 256 else ''
+        elif kind == 'tool_result' and not (entry['text_complete'] and len(text.encode()) <= 512):
+            spans = entry.get('outcome_spans', [])
+            text = '\n'.join('text bytes [%s,%s):\n%s' % (s['text_byte_start'], s['text_byte_end'], s['text']) for s in spans)
+            end, gaps = 0, []
+            for span in spans:
+                if span['text_byte_start'] > end:
+                    gaps.append('[%s,%s)' % (end, span['text_byte_start']))
+                end = span['text_byte_end']
+            if end < entry['original_text_bytes']:
+                gaps.append('[%s,%s)' % (end, entry['original_text_bytes']))
+            text += '\nomitted text gaps: ' + ','.join(gaps)
+        elif not entry.get('text_complete'):
+            fields.append('CLIPPED [%s,%s) omitted' % (len(text.encode()), entry['original_text_bytes']))
+        blocks.append((ref, kind, (' | '.join(fields) + '\n' + (text + '\n' if text else '') + '\n').encode()))
+        emitted_classes[kind] = emitted_classes.get(kind, 0) + 1
+    def footer(count):
+        omitted = blocks[count:]
+        ranges = ','.join(report_ref({'line': ref[0], **({'content_index': ref[1]} if ref[1] >= 0 else {})}) for ref, _, _ in omitted)
+        excluded = {kind: n - emitted_classes.get(kind, 0) for kind, n in classes.items() if n > emitted_classes.get(kind, 0)}
+        return ('Projection complete: %s; emitted union records: %s/%s\nExcluded retained classes: %s\n'
+                'Omitted native ranges: %s\nSource/retention caveats above remain independent of projection completeness.\nEND OF BOUNDED CHRONOLOGY REPORT\n' % (
+                    not omitted, count, len(blocks), json.dumps(excluded, separators=(',', ':')), ranges or 'none')).encode()
+    data = header.encode()
+    count, size = len(blocks), len(data) + sum(len(block) for _, _, block in blocks)
+    while count and size + len(footer(count)) > REPORT_LIMIT:
+        count -= 1
+        size -= len(blocks[count][2])
+    tail = footer(count)
+    if size + len(tail) > REPORT_LIMIT:
+        raise OSError('chronology report framing exceeds report allowance')
+    return data + b''.join(block for _, _, block in blocks[:count]) + tail, {
+        'records': count, 'union_records': len(blocks), 'omitted_records': len(blocks) - count,
+        'projection_complete': count == len(blocks), 'selected_classes': emitted_classes,
+        'retained_classes': classes, 'limit_bytes': REPORT_LIMIT}
+
+
+def retain_interval(entries, anchor, *, cutoff, omissions, scope, source_complete,
+                    temporal_complete, pending, masked, budget):
+    data, projection = chronology_report(entries, anchor, cutoff=cutoff, omissions=omissions,
+        scope=scope, source_complete=source_complete, temporal_complete=temporal_complete,
+        pending=pending, masked=masked, budget=budget)
+    budget.check('chronology_report')
     directory = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'jsonl-history-search' / 'interval-evidence'
     # Check existing ancestors before creating anything: a rejected link must
     # not create directories outside the caller-selected cache location.
@@ -300,31 +402,11 @@ def retain_interval(entries, anchor, *, cutoff, omissions):
     info = directory.lstat()
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise OSError('interval-artifact directory must be owner-only')
-    fd, name = tempfile.mkstemp(prefix='native-', suffix='.jsonl', dir=directory)
-    digest, total, saved, omitted = hashlib.sha256(), 0, 0, 0
+    fd, name = tempfile.mkstemp(prefix='native-', suffix='.txt', dir=directory)
     with os.fdopen(fd, 'wb') as handle:
-        header = {'kind': 'bounded_native_interval_excerpts', 'anchor': anchor,
-            'source_path': anchor['source_ref']['path'],
-            'cutoff': cutoff.isoformat(), 'omissions': omissions,
-            'claim_boundary': 'Exact bounded excerpts; claims/invocations/returned outcomes differ. Child sessions not established complete.'}
-        data = encoded(header) + b'\n'
-        if len(data) > RETAIN_LIMIT:
-            raise OSError('interval artifact header exceeds retained allowance')
         handle.write(data)
-        digest.update(data)
-        total += len(data)
-        for entry in entries:
-            data = encoded(entry) + b'\n'
-            if total + len(data) > RETAIN_LIMIT:
-                omitted += 1
-                continue
-            handle.write(data)
-            digest.update(data)
-            total += len(data)
-            saved += 1
-    return {'path': name, 'sha256': digest.hexdigest(), 'bytes': total,
-            'records': saved, 'omitted_records': omitted,
-            'format': 'readable JSONL exact excerpts/native refs; source_path header binds per-record lines', 'requires_continuation': False}
+    return {'path': name, 'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data),
+            **projection, 'format': 'plain UTF-8 chronology report', 'requires_continuation': False}
 
 
 def display_entries(entries, allowance, contexts, path):
@@ -454,9 +536,12 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     artifact = None
     if chosen:
         try:
-            artifact = retain_interval(entries, chosen.anchor, cutoff=cutoff, omissions=omissions)
+            artifact = retain_interval(entries, chosen.anchor, cutoff=cutoff, omissions=omissions,
+                scope=scope, source_complete=source_complete, temporal_complete=temporal,
+                pending=chosen.pending, masked=mask_context, budget=budget)
         except OSError as exc:
             errors.append({'reason': 'interval artifact unavailable: ' + str(exc)})
+        caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
     if artifact and artifact['omitted_records']:
         omissions['artifact_records'] = artifact['omitted_records']
     if parent and not parents:

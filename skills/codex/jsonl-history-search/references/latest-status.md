@@ -8,7 +8,9 @@ Preserve parent/main-thread scope. Genuine human turns, not worker assignments,
 injected control messages or compaction summaries, define human boundaries.
 Read the returned anchor, native interval evidence and actual coverage. A
 selected session is not verified requesting-side parent lineage. Read the
-bounded interval artifact when display omissions affect the answer. Visible
+bounded plain-text report from the returned path; check its complete footer,
+and treat a truncated read as incomplete. Reported claims are not verified
+returned outcomes; paired refs do not prove omitted arguments. Visible
 context, summaries and Git state cannot replace missing conversation proof.
 
 Summarize useful supported events even when coverage is partial; do not label

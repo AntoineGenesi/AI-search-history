@@ -580,6 +580,16 @@ def render_history_evidence(payload: dict) -> str:
         if anchor:
             lines.append('Human boundary: %s | %s | %s' % (ref_target(anchor['source_ref']), anchor['timestamp'], anchor['text']))
         lines.append('Time uncertainty: ' + str(not chronology['temporal_complete']))
+        artifact = chronology.get('interval_artifact')
+        if artifact:
+            lines.extend(['Read the report as plain text: ' + artifact['path'],
+                'Report bytes: %s; SHA256: %s' % (artifact['bytes'], artifact['sha256']),
+                'Projection complete: %s; omitted union records: %s' % (artifact['projection_complete'], artifact['omitted_records']),
+                'Scope/cutoff: %s | %s' % (chronology['scope'], chronology['cutoff']),
+                'Check END OF BOUNDED CHRONOLOGY REPORT after reading; a truncated read is incomplete.',
+                'This selected report is artifact-assisted evidence, not all raw results or verified child activity.',
+                payload['claim_boundary']])
+            return '\n'.join(lines)
         for item in payload['evidence']:
             if item.get('records'):
                 original = item['text'].encode()
