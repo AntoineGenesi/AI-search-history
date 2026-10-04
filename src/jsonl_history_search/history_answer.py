@@ -103,6 +103,10 @@ def native_metadata_identity(body):
     return next(iter(owners)), worker, present[0] if present and not conflict else None, conflict
 
 
+class NativeTargetIntegrityError(ValueError):
+    """Observed owning metadata no longer supports the selected target."""
+
+
 def discover_native_sessions(files, *, plan, budget, default_tz):
     """Complete owning record only; every header read shares the body budget."""
     metadata, errors, stats = [], [], RawLineScanStats()
@@ -238,7 +242,7 @@ def admit(state, entry, limit):
 
 
 def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context,
-                 retained_limit, request_session, request_turn, query, live_request):
+                 retained_limit, request_session, request_turn, query, live_request, expected_identity=None):
     if not state.path.stat().st_mode & 0o444:
         raise PermissionError('source has no read permission bits')
     for record in iter_records_for_file(state.path, kind, default_tz,
@@ -260,16 +264,23 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             if not isinstance(raw.get('message'), dict):
                 raise ValueError('Claude native message shape unavailable')
             if state.session and (state.session != owner or state.worker != raw['isSidechain']):
-                raise ValueError('conflicting Claude native session/sidechain ownership')
+                raise (NativeTargetIntegrityError if expected_identity else ValueError)('conflicting Claude native session/sidechain ownership')
+            if expected_identity and (owner, raw['isSidechain'], None, False) != expected_identity:
+                raise NativeTargetIntegrityError('changed Claude native owning metadata')
             if not state.session:
                 state.session, state.worker, state.cwd = owner, raw['isSidechain'], raw.get('cwd')
         if state.session and body.get('thread_id') and str(body['thread_id']) != state.session:
-            raise ValueError('native event thread conflicts with owning session')
+            raise (NativeTargetIntegrityError if expected_identity else ValueError)('native event thread conflicts with owning session')
         if top == 'session_meta':
-            owner, worker, parent, conflict = native_metadata_identity(body)
+            try:
+                owner, worker, parent, conflict = native_metadata_identity(body)
+            except ValueError as exc:
+                raise (NativeTargetIntegrityError if expected_identity else ValueError)(str(exc))
+            if expected_identity and (owner, worker, parent, conflict) != expected_identity:
+                raise NativeTargetIntegrityError('changed native owning metadata')
             if state.session:
                 if owner != state.session or worker != state.worker:
-                    raise ValueError('conflicting native session ownership metadata')
+                    raise (NativeTargetIntegrityError if expected_identity else ValueError)('conflicting native session ownership metadata')
                 if conflict or parent != state.parent:
                     state.parent, state.parent_conflict = None, True
                 continue
@@ -278,6 +289,8 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             state.worker, state.parent, state.parent_conflict = worker, parent, conflict
             state.controls += 1
             continue
+        if expected_identity and not state.session:
+            raise NativeTargetIntegrityError('selected body owning metadata unavailable')
         timestamp = record.timestamp.astimezone(timezone.utc) if record.timestamp else None
         if timestamp and state.last_time and timestamp < state.last_time:
             state.temporal_complete = False
@@ -666,7 +679,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
                     discovery_errors.append({'reason': 'requested native parent missing, conflicting or unavailable; own-session candidate activity only'})
         else:
             discovery_errors.append({'reason': 'requesting native owner missing or conflicting; no unique target verified'})
-    scan_files = [f for f in files if f[0] == target.path] if target else files
+    scan_files = [f for f in files if f[0] == target.path] if target else files if explicit_roots else []
     for path, _, _ in scan_files:
         state = NativeSession(path=path)
         states.append(state)
@@ -678,11 +691,22 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             retained_limit = max(0, RETAIN_LIMIT - 8192 - sum(s.retained_cost for s in states))
             scan_session(state, kind=kind, default_tz=default_tz, budget=budget, stats=stats,
                 cutoff=cutoff, mask_context=mask_context, retained_limit=retained_limit,
-                request_session=request_session, request_turn=request_turn, query=query, live_request=live_request)
+                request_session=request_session, request_turn=request_turn, query=query, live_request=live_request,
+                expected_identity=(target.session, target.worker, target.parent, target.parent_conflict) if target else None)
+            if target and not state.session:
+                raise NativeTargetIntegrityError('selected body owning metadata unavailable')
             if state.records and not state.session:
                 state.anchor = None
                 state.entries.clear()
                 errors.append({'path': str(path), 'reason': 'native owning session/worker provenance unavailable; provider chronology unsupported'})
+        except NativeTargetIntegrityError as exc:
+            # Finalization must not restore a pending earlier interval after
+            # native identity becomes ineligible, including later contradictions.
+            state.anchor, state.previous_interval, state.request_candidate, state.request_boundary = None, None, None, None
+            state.entries, state.pending, state.retained_cost = [], {}, 0
+            state.complete = False
+            target_scope = 'target_integrity_unavailable'
+            errors.append({'path': str(path), 'reason': 'target integrity: ' + str(exc)})
         except (OSError, ValueError, TypeError) as exc:
             errors.append({'path': str(path), 'reason': str(exc)})
         finally:
@@ -708,6 +732,8 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
     discovery_complete = not (caps or discovery_errors) if not explicit_roots else None
     source_complete = not (caps or errors or (unavailable if explicit_roots else []) or len(states) != len(scan_files) or any(not s.complete for s in states))
+    if not explicit_roots and not target:
+        source_complete = False
     temporal = bool(chosen and chosen.temporal_complete)
     complete = source_complete and temporal and chosen is not None and chosen.boundary_complete
     if not explicit_roots:
