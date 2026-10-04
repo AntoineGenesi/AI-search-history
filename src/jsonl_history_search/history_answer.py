@@ -86,10 +86,10 @@ def resolve_request_boundary(state, request_turn, live_request):
     if not candidate:
         return
     turn = candidate['turn']
-    explicit = bool(request_turn and turn == request_turn and not state.turn_conflict)
+    closed = bool(turn and state.closed_turn == turn and not state.open_turn and not state.turn_conflict)
+    explicit = bool(request_turn and turn == request_turn and not closed and not state.turn_conflict)
     inferred = bool(live_request and state.complete and turn and state.open_turn == turn
                     and state.open_turn_ref and not state.turn_conflict)
-    closed = bool(turn and state.closed_turn == turn and not state.open_turn and not state.turn_conflict)
     state.request_boundary = {'request_ref': candidate['anchor']['source_ref'],
         'mirror_lines': candidate['anchor'].get('native_mirror_lines', []),
         'start_ref': state.open_turn_ref,
@@ -244,6 +244,7 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if event in {'task_complete', 'task_completed', 'turn_aborted'} and body.get('turn_id'):
             if state.open_turn == body['turn_id']:
                 state.closed_turn, state.open_turn = state.open_turn, None
+                state.current_turn, state.open_turn_ref = None, None
             elif state.open_turn:
                 state.turn_conflict = True
         if state.anchor:
