@@ -263,8 +263,6 @@ def render_text(payload: dict) -> str:
         return render_bulk_line_match_text(payload)
     if "failure_analysis" in payload:
         return render_failure_analysis_text(payload)
-    if "latest_user_messages" in payload:
-        return render_latest_user_messages_text(payload)
     if "artifact_currentness" in payload:
         return render_artifact_currentness_text(payload)
     if "local_evidence_diagnostic" in payload:
@@ -450,8 +448,6 @@ def render_markdown(payload: dict) -> str:
         return render_bulk_line_match_markdown(payload)
     if "failure_analysis" in payload:
         return render_failure_analysis_markdown(payload)
-    if "latest_user_messages" in payload:
-        return render_latest_user_messages_markdown(payload)
     if "artifact_currentness" in payload:
         return render_artifact_currentness_markdown(payload)
     if "local_evidence_diagnostic" in payload:
@@ -4108,60 +4104,8 @@ def render_expansion_family_audit_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def render_latest_user_messages_text(payload: dict) -> str:
-    report = payload["latest_user_messages"]
-    summary = report["summary"]
-    lines = [
-        "Latest User Messages",
-        f"Status: {report['status']}",
-        f"Lookup: {report['lookup']}",
-        f"Sort: {report['sort_strategy']}",
-        (
-            "Searched: "
-            f"{summary['searched_files']} files, {summary['records_read']} records, "
-            f"{summary['candidate_user_message_count']} user candidates, "
-            f"{summary['deduped_mirror_count']} deduped mirrors"
-        ),
-    ]
-    for warning in report["sources"].get("warnings", []):
-        lines.append(f"Warning: {warning}")
-    for message in report["messages"]:
-        lines.append(
-            f"- {message['local_timestamp']} {message['source_kind']} "
-            f"{message['source_identifier']} {message['source_ref']}: {message['snippet']}"
-        )
-    return "\n".join(lines)
 
 
-def render_latest_user_messages_markdown(payload: dict) -> str:
-    report = payload["latest_user_messages"]
-    summary = report["summary"]
-    lines = [
-        "# Latest User Messages",
-        "",
-        f"**Status:** {report['status']}",
-        f"**Lookup:** {report['lookup']}",
-        f"**Sort:** {report['sort_strategy']}",
-        (
-            f"**Searched:** {summary['searched_files']} files, "
-            f"{summary['records_read']} records, "
-            f"{summary['candidate_user_message_count']} user candidates, "
-            f"{summary['deduped_mirror_count']} deduped mirrors"
-        ),
-        "",
-    ]
-    warnings = report["sources"].get("warnings", [])
-    if warnings:
-        lines.append("## Warnings")
-        lines.extend(f"- {warning}" for warning in warnings)
-        lines.append("")
-    lines.append("## Messages")
-    for message in report["messages"]:
-        lines.append(
-            f"- `{message['local_timestamp']}` `{message['source_kind']}` "
-            f"`{message['source_identifier']}` `{message['source_ref']}`: {message['snippet']}"
-        )
-    return "\n".join(lines)
 
 
 

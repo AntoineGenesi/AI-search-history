@@ -53,21 +53,6 @@ class LatestUserMessage:
     correlation_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
-def build_latest_user_messages_payload(args) -> dict:
-    default_tz = _timezone_from_args(args)
-    codex_home = Path(args.codex_home).expanduser() if args.codex_home else Path.home() / ".codex"
-    limit = getattr(args, "limit", None) or args.max_matches
-    snippet_chars = max(0, getattr(args, "snippet_chars", 500))
-    result = latest_user_messages(
-        codex_home=codex_home,
-        default_tz=default_tz,
-        limit=limit,
-        max_files=args.max_files,
-        max_bytes=args.max_bytes,
-        max_elapsed=args.max_elapsed,
-        snippet_chars=snippet_chars,
-    )
-    return {"latest_user_messages": result}
 
 
 def latest_user_messages(
@@ -761,9 +746,3 @@ def _mtime(path: Path) -> float:
         return path.stat().st_mtime
     except OSError:
         return 0.0
-
-
-def _timezone_from_args(args):
-    from .timeutil import timezone_from_args
-
-    return timezone_from_args(args.timezone, args.timezone_offset)
