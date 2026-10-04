@@ -229,7 +229,9 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                 else:
                     original.pop('native_mirror_lines', None)
             continue
-        human = classification.is_human_authored and not state.worker
+        claude_plain_human = (claude and top == 'user' and raw['message'].get('role') == 'user'
+                              and isinstance(content, str) and bool(content.strip()))
+        human = (classification.is_human_authored or claude_plain_human) and not state.worker
         is_current = (request_session and request_turn and state.session == request_session
                       and (body.get('turn_id') or state.current_turn) == request_turn)
         if human and not is_current:
@@ -279,6 +281,15 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
 
 def retain_interval(entries, anchor, *, cutoff, omissions):
     directory = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'jsonl-history-search' / 'interval-evidence'
+    # Check existing ancestors before creating anything: a rejected link must
+    # not create directories outside the caller-selected cache location.
+    for candidate in [directory] + list(directory.parents)[:-1]:
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+            raise OSError('unsafe linked or writable interval-artifact directory')
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     for candidate in [directory] + list(directory.parents)[:-1]:
         info = candidate.lstat()
@@ -323,35 +334,59 @@ def display_entries(entries, allowance, contexts, path):
     for group in groups:
         # Distribute native structural episodes over the full interval, with
         # claims and actual returned dispositions. No lexical/task ranking.
-        important = [e for e in group if e.get('outcome_spans')]
-        chosen = [e for e in group if e['kind'] == 'human_message_start']
-        for event in important:
+        chosen = [e for e in group if e['kind'] in {'human_message_start', 'reported_claim'}]
+        for event in [e for e in group if e['kind'] == 'tool_result']:
             position = group.index(event)
-            claims = [e for e in group[:position] if e['kind'] == 'reported_claim']
+            following = []
+            for subsequent in group[position + 1:]:
+                if subsequent['kind'] == 'tool_invocation':
+                    break
+                if subsequent['kind'] == 'reported_claim':
+                    following.append(subsequent)
+            if not following and not event.get('outcome_spans'):
+                continue
             calls = [e for e in group[:position] if e['kind'] == 'tool_invocation' and e.get('call_id') == event.get('call_id')]
-            for e in (claims[-1:] + calls[-1:] + [event]):
+            for e in (calls[-1:] + [event] + following):
                 if e not in chosen:
                     chosen.append(e)
         if not chosen:
             chosen = group[:1] + group[-1:] if len(group) > 1 else group
-        # Account for each delivered separator, not only excerpt bodies.
-        pieces, quota = [], max(0, (per_group - len(chosen)) // len(chosen))
-        for item in chosen:
-            text = clip(item['text'], quota)
+        # Complete short reported assessments are independently useful; do not
+        # shrink every episode to a tiny call prefix. Admit actual complete
+        # pieces against each chronological group's allowance, then expose the
+        # remaining native omissions through the retained interval contract.
+        pieces, remaining = [], per_group
+        ordered = ([e for e in chosen if e['kind'] in {'human_message_start', 'reported_claim'}]
+                   + [e for e in chosen if e['kind'] == 'tool_result']
+                   + [e for e in chosen if e['kind'] == 'tool_invocation'])
+        for item in ordered:
+            text = item['text']
             spans = [{'text_byte_start': 0, 'text_byte_end': len(text.encode()), 'text': text}]
             if item.get('outcome_spans'):
                 # Keep original text offsets. Never move disposition lines under
                 # a different source, or present a synthetic contiguous passage.
                 spans = []
                 for span in item['outcome_spans']:
-                    value = clip(span['text'], max(0, (quota - len(item['outcome_spans']) + 1) // len(item['outcome_spans'])))
+                    value = span['text']
                     spans.append({'text_byte_start': span['text_byte_start'], 'text_byte_end': span['text_byte_start'] + len(value.encode()), 'text': value})
                 text = '\n'.join(s['text'] for s in spans)
+            cost = len(text.encode()) + 1
+            if cost > remaining:
+                continue
             if text:
                 pieces.append({'source_ref': item['source_ref'], 'timestamp': item['timestamp'],
                     'kind': item['kind'], 'text': text, 'spans': spans,
                     'text_complete': item['text_complete'] and text == item['text'],
                     **({'invocation_ref': item['invocation_ref']} if 'invocation_ref' in item else {})})
+                remaining -= cost
+        pieces.sort(key=lambda e: (e['source_ref']['line'], e['source_ref'].get('content_index', -1)))
+        if not pieces and chosen:
+            item = chosen[0]
+            text = clip(item['text'], max(0, per_group - 1))
+            if text:
+                pieces = [{'source_ref': item['source_ref'], 'timestamp': item['timestamp'], 'kind': item['kind'],
+                    'text': text, 'spans': [{'text_byte_start': 0, 'text_byte_end': len(text.encode()), 'text': text}],
+                    'text_complete': False, **({'invocation_ref': item['invocation_ref']} if 'invocation_ref' in item else {})}]
         if pieces:
             text, references = '', []
             for piece in pieces:
