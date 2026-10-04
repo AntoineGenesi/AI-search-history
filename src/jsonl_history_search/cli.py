@@ -78,7 +78,6 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
-from .latest_user_messages import build_latest_user_messages_payload
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
 from .manifest import build_manifest_report
@@ -156,7 +155,6 @@ from .source_expansion import (
     build_source_expansion_payload,
 )
 from .sources import Limits, SourcePlan, build_jsonl_candidate_discovery, build_source_plan, normalize_local_path
-from .status_anchor import DEFAULT_STATUS_QUERY, build_status_anchor_payload
 from .timeutil import parse_datetime, parse_now, timezone_from_args
 from .tool_events import build_tool_events_payload
 from .workflow_repeat import build_workflow_repeat_payload
@@ -197,7 +195,7 @@ token savings, all-history coverage, or broad superiority.
 
 Internal command groups:
   Agent-facing front doors:
-    ask, semantic-debug, what-happened-since, semantic-wrapup,
+    ask, semantic-debug, semantic-wrapup,
     artifact-currentness, skill-check/skill-audit, no-evidence-report,
     bulk-line-match, read-more, follow-next-reads
   Local diagnostics:
@@ -292,65 +290,6 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
         type=int,
         default=260,
         help="Maximum candidate snippet characters; 0 keeps the parsed record text.",
-    )
-    latest_user = subparsers.add_parser(
-        "latest-user-messages",
-        description=(
-            "Deterministic newest-first lookup for high-confidence Codex user "
-            "messages. This does not use semantic search or phrase ranking."
-        ),
-    )
-    add_common_args(latest_user)
-    latest_user.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Maximum user messages to return; defaults to --max-matches.",
-    )
-    latest_user.add_argument(
-        "--snippet-chars",
-        type=int,
-        default=500,
-        help="Maximum characters of each message snippet to include; 0 keeps the full text.",
-    )
-    status_anchor = subparsers.add_parser(
-        "what-happened-since",
-        description=(
-            "JSONL-first status-anchor workflow for natural questions like "
-            "'what happened since my last message?' or 'what did you do while I was away?'."
-        ),
-    )
-    status_anchor.add_argument("query", nargs="?", default=DEFAULT_STATUS_QUERY)
-    add_common_args(status_anchor)
-    for action in status_anchor._actions:
-        if action.dest == "format":
-            action.choices = ("text", "json", "markdown", "answer")
-            break
-    status_anchor.add_argument(
-        "--parent-thread",
-        action="store_true",
-        help="Require a proven parent-thread anchor/boundary before answer-mode promotion.",
-    )
-    status_anchor.add_argument(
-        "--complete-interval",
-        action="store_true",
-        help="Collect post-anchor interval activity up to the complete-interval hard cap before answer-mode rendering.",
-    )
-    status_anchor.add_argument(
-        "--anchor-ref",
-        help="Use an exact canonical codex_history:history.jsonl:<line> parent-thread anchor.",
-    )
-    status_anchor.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Maximum recent user messages to inspect for anchor candidates; defaults to --max-matches.",
-    )
-    status_anchor.add_argument(
-        "--snippet-chars",
-        type=int,
-        default=280,
-        help="Maximum characters of each message snippet to include; 0 keeps the full text.",
     )
     artifact_currentness = subparsers.add_parser(
         "artifact-currentness",
@@ -2110,33 +2049,6 @@ def _attach_retrieval_output_report_diagnostics(
         phase_profiles[phase] = profile
 
 
-def _persist_status_anchor_active_continuation_report(payload: dict) -> None:
-    report = payload.get("status_anchor") if isinstance(payload, dict) else None
-    if not isinstance(report, dict) or report.get("report_written"):
-        return
-    packet = report.get("parent_thread_interval_continuation")
-    selected = report.get("selected_anchor")
-    if not (
-        isinstance(packet, dict)
-        and packet.get("packet_id")
-        and packet.get("steps")
-        and isinstance(selected, dict)
-        and selected.get("source_ref")
-        and (report.get("answer_readiness") or {}).get("answer_allowed") is not True
-    ):
-        return
-    handle = tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix="jsonl-history-search-status-anchor-",
-        suffix=".json",
-        delete=False,
-    )
-    with handle:
-        report["report_written"] = handle.name
-        handle.write(render(payload, "json"))
-
-
 # Exclusive bound that includes JSH-896's last observed event at 12:27:59.905Z.
 
 
@@ -3105,15 +3017,12 @@ def _named_task_source_session_action_argv(argv: list[str]) -> bool:
         return (
             module == "jsonl_history_search.cli"
             and module_index + 1 < len(argv)
-            and argv[module_index + 1] in {"ask", "what-happened-since"}
+            and argv[module_index + 1] == "ask"
         )
     if executable == "git":
         subcommand = _named_task_source_session_git_subcommand(argv)
         return subcommand in {"commit", "apply"} or (subcommand == "diff" and "--check" in argv)
-    return executable == "jsonl-history-search" and len(argv) > 1 and argv[1] in {
-        "ask",
-        "what-happened-since",
-    }
+    return executable == "jsonl-history-search" and len(argv) > 1 and argv[1] == "ask"
 
 
 def _named_task_source_session_setup_argv(argv: list[str]) -> bool:
@@ -3306,9 +3215,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         budget = OperationBudget(limit_bytes=min(args.max_bytes, args.hard_cap_bytes) if args.hard_cap_bytes else args.max_bytes, max_elapsed=args.max_elapsed)
         _source_plan, intent, plan = payload_from_args(args)
-        payload = retrieve_history_evidence(query=args.query, intent=intent, plan=plan,
-            default_tz=timezone_from_args(args.timezone, args.timezone_offset), budget=budget,
-            mask_context=_mask_context_from_args(args), output_format=args.format)
+        from .history_answer import is_direct_latest_message_history_query, retrieve_chronological_evidence
+        default_tz = timezone_from_args(args.timezone, args.timezone_offset)
+        operation = retrieve_chronological_evidence if is_direct_latest_message_history_query(args.query) else retrieve_history_evidence
+        extra = {'cutoff': parse_now(_source_plan['now'], default_tz), 'requested_cwd': args.cwd,
+                 'live_request': args.now is None, 'explicit_roots': bool(args.root)} if operation is retrieve_chronological_evidence else {}
+        payload = operation(query=args.query, intent=intent, plan=plan,
+            default_tz=default_tz, budget=budget,
+            mask_context=_mask_context_from_args(args), output_format=args.format, **extra)
         print(render(payload, args.format))
         return 0
     if args.command == "retained-source-read":
@@ -4064,30 +3978,6 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         status = payload["archive_snapshot_proof"]["status"]
         return 1 if status in {"invalid_request", "proof_failed"} else 0
-    if args.command == "latest-user-messages":
-        payload = build_latest_user_messages_payload(args)
-        print(render(payload, args.format))
-        return 0
-    if args.command == "what-happened-since":
-        phase_emitter = (
-            AskExecutePhaseEmitter(command=args.command)
-            if args.parent_thread and args.complete_interval
-            else None
-        )
-        source_phase = phase_emitter.start("source_planning") if phase_emitter else None
-        if phase_emitter and source_phase:
-            phase_emitter.complete(source_phase)
-        retrieval_phase = phase_emitter.start("retrieval") if phase_emitter else None
-        payload = build_status_anchor_payload(args)
-        _persist_status_anchor_active_continuation_report(payload)
-        if phase_emitter and retrieval_phase:
-            phase_emitter.complete(retrieval_phase)
-        rendering_phase = phase_emitter.start("rendering") if phase_emitter else None
-        rendered = render(payload, args.format)
-        if phase_emitter and rendering_phase:
-            phase_emitter.complete(rendering_phase)
-        print(rendered)
-        return 0 if payload["status_anchor"]["status"] == "ok" else 1
     if args.command == "artifact-currentness":
         from .artifact_currentness import build_artifact_currentness_payload
 

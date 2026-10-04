@@ -75,14 +75,14 @@ def agent_question_cookbook(*, cli_prefix: str = "jsonl-history-search") -> list
         {
             "id": "parent_anchor_status",
             "question_family": "What happened since my last message?",
-            "route": "latest-status / what-happened-since",
+            "route": "ordinary ask native chronology",
             "first_command": (
-                'jsonl-history-search what-happened-since "what happened since my last message in the main thread?" '
+                'jsonl-history-search ask "what happened since my last message in the main thread?" '
                 '--cwd "$PWD" --format text'
             ),
             "inspect_next": (
-                "status_anchor.parent_main_anchor_shortlist, follow_through_plan open_first, "
-                "selected_anchor, and raw sessions/**/*.jsonl activity after the anchor"
+                "chronology.anchor, scope, temporal uncertainty, source/display coverage "
+                "and the directly readable interval_artifact"
             ),
         },
         {

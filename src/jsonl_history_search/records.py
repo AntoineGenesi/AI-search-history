@@ -56,6 +56,29 @@ def compact_json(value: Any) -> str:
         return str(value)
 
 
+def native_message_payload(raw):
+    """Read-only view of Codex message transports; keep original raw evidence.
+
+    item_completed wraps native UserMessage/AgentMessage events. Matching
+    thread/turn identity is available to consumers; equal text is not identity.
+    """
+    payload = raw.get('payload', raw)
+    if not isinstance(payload, dict):
+        return payload
+    if raw.get('type') == 'response_item':
+        metadata = payload.get('internal_chat_message_metadata_passthrough')
+        if isinstance(metadata, dict) and metadata.get('turn_id'):
+            return {**payload, 'turn_id': metadata['turn_id']}
+    item = payload.get('item')
+    if raw.get('type') == 'event_msg' and payload.get('type') == 'item_completed' and isinstance(item, dict):
+        if item.get('type') in {'UserMessage', 'AgentMessage'}:
+            return {**payload, 'type': 'message',
+                'role': 'user' if item['type'] == 'UserMessage' else 'assistant',
+                'content': item.get('content') or [{'type': 'text', 'text': item.get('text', '')}],
+                'message_id': item.get('id')}
+    return payload
+
+
 def parse_record(raw: str, *, path: Path, line: int, default_tz) -> Record:
     try:
         data = json.loads(raw)
@@ -67,12 +90,14 @@ def parse_record(raw: str, *, path: Path, line: int, default_tz) -> Record:
     text = ""
     cwd = data.get("cwd") or data.get("project") or data.get("project_cwd")
 
-    payload = data.get("payload")
+    payload = native_message_payload(data)
     if isinstance(payload, dict):
         role = payload.get("type") or payload.get("role") or role
         raw_timestamp = payload.get("timestamp") or raw_timestamp
         cwd = payload.get("cwd") or payload.get("project") or cwd
         payload_type = payload.get("type")
+        # Native event transports use both snake_case and enum spelling.
+        payload_type = {"UserMessage": "user_message", "AgentMessage": "agent_message"}.get(payload_type, payload_type)
         if payload_type == "message" and payload.get("role"):
             role = payload.get("role")
         if payload_type == "function_call":
