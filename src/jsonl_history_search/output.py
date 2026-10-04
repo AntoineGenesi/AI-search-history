@@ -571,11 +571,15 @@ def render(payload: dict, output_format: str) -> str:
 def render_history_evidence(payload: dict) -> str:
     from .source_refs import ref_target
     lines = [payload['query'], 'Status: ' + payload['status'],
-             'Selected sources fully read: ' + str(payload['coverage']['complete'])]
+             'Source scan complete: ' + str(payload['coverage'].get('source_complete', payload['coverage']['complete']))]
     lines.append('Searched scope: ' + json.dumps(payload['scope'], ensure_ascii=False))
+    for field in ('cap_reasons', 'unavailable_roots', 'source_errors'):
+        if payload['coverage'][field]:
+            lines.append(field + ': ' + json.dumps(payload['coverage'][field], ensure_ascii=False))
     if 'chronology' in payload:
         chronology = payload['chronology']
         lines.append('Chronological scope: ' + chronology['scope'])
+        lines.append('Supported chronology complete: ' + str(payload['coverage']['complete']))
         anchor = chronology.get('anchor')
         if anchor:
             lines.append('Human boundary: %s | %s | %s' % (ref_target(anchor['source_ref']), anchor['timestamp'], anchor['text']))
@@ -596,9 +600,6 @@ def render_history_evidence(payload: dict) -> str:
         lines.append('Display coverage: ' + json.dumps(chronology['display']))
         lines.extend(['', 'Omissions: ' + json.dumps(payload['omissions']), payload['claim_boundary']])
         return '\n'.join(lines)
-    for field in ('cap_reasons', 'unavailable_roots', 'source_errors'):
-        if payload['coverage'][field]:
-            lines.append(field + ': ' + json.dumps(payload['coverage'][field], ensure_ascii=False))
     if not payload.get('query_display', {}).get('complete', True):
         lines.append('[Displayed question excerpt; original question was used locally.]')
     for item in payload['evidence']:
