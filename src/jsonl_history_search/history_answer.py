@@ -91,11 +91,11 @@ def resolve_request_boundary(state, request_turn, live_request):
                     and state.open_turn_ref and not state.turn_conflict)
     state.request_boundary = {'request_ref': candidate['anchor']['source_ref'],
         'mirror_lines': candidate['anchor'].get('native_mirror_lines', []),
-        'start_ref': state.open_turn_ref,
+        'start_ref': candidate.get('start_ref'),
         'terminal_ref': candidate.get('terminal_ref'),
         'basis': 'environment turn corroborated by native occurrence' if explicit else
                  'owned session, terminal native open turn and exact request' if inferred else
-                 'native turn completed; historical human retained' if closed else
+                 'native terminal proof; historical human retained' if closed else
                  'conflicting native live-turn identity' if state.turn_conflict else
                  'native source inspection incomplete' if not state.complete else
                  'native live open-turn identity unavailable',
@@ -236,6 +236,7 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if event == 'task_started' and body.get('turn_id'):
             if state.request_candidate and state.request_candidate['turn'] == body['turn_id']:
                 state.request_candidate['terminal_ref'] = None
+                state.request_candidate['start_ref'] = evidence_ref(record)
             if state.open_turn and state.open_turn != body['turn_id']:
                 state.turn_conflict = True
             elif not state.open_turn:
@@ -335,7 +336,8 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             # untimed rows retain their explicit temporal uncertainty.
             state.anchor = excerpt(record, kind='human_message_start', mask_context=mask_context)
             state.anchor_time = timestamp
-            state.request_candidate = {'anchor': state.anchor, 'turn': native_turn} if candidate else None
+            state.request_candidate = {'anchor': state.anchor, 'turn': native_turn,
+                'start_ref': state.open_turn_ref if state.open_turn == native_turn else None} if candidate else None
             state.entries, state.pending = [], {}
             if not state.previous_interval:
                 state.retained_cost = 0
