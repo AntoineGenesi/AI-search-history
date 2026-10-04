@@ -98,9 +98,9 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
 def admit(state, entry, limit):
     # All interval records bind to this session's single physical source. Store
     # that identity once in the artifact header rather than thousands of times.
-    entry['source_ref'] = {'line': entry['source_ref']['line']}
+    entry['source_ref'] = {k: v for k, v in entry['source_ref'].items() if k in {'line', 'content_index'}}
     if entry.get('invocation_ref'):
-        entry['invocation_ref'] = {'line': entry['invocation_ref']['line']}
+        entry['invocation_ref'] = {k: v for k, v in entry['invocation_ref'].items() if k in {'line', 'content_index'}}
     cost = len(encoded(entry)) + 1
     if state.retained_cost + cost > limit:
         state.retention_omitted += 1
@@ -125,6 +125,15 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if raw.get('inherited') or body.get('inherited') or body.get('is_replay'):
             state.controls += 1
             continue
+        claude = 'sessionId' in raw and top in {'user', 'assistant'}
+        if claude:
+            owner = raw.get('sessionId')
+            if not isinstance(owner, str) or not owner or not isinstance(raw.get('isSidechain'), bool):
+                raise ValueError('Claude native session/sidechain ownership unavailable')
+            if state.session and (state.session != owner or state.worker != raw['isSidechain']):
+                raise ValueError('conflicting Claude native session/sidechain ownership')
+            if not state.session:
+                state.session, state.worker, state.cwd = owner, raw['isSidechain'], raw.get('cwd')
         if state.session and body.get('thread_id') and str(body['thread_id']) != state.session:
             raise ValueError('native event thread conflicts with owning session')
         if top == 'session_meta':
@@ -167,6 +176,36 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                                     TURN_CONTROL_OR_STATUS, SUBAGENT_NOTIFICATION}:
             state.controls += 1
             continue
+        content = (raw.get('message') or {}).get('content') if claude and isinstance(raw.get('message'), dict) else None
+        if isinstance(content, list):
+            if state.anchor:
+                for index, item in enumerate(content):
+                    if not isinstance(item, dict) or item.get('type') not in {'tool_use', 'tool_result'}:
+                        continue
+                    invocation = item['type'] == 'tool_use'
+                    value = str(item.get('name') or '') + ' ' + json.dumps(item.get('input'), ensure_ascii=False) if invocation else text_from_item(item.get('content'))
+                    entry = excerpt(record, kind='tool_invocation' if invocation else 'tool_result', mask_context=mask_context, text=value)
+                    entry['source_ref']['content_index'] = index
+                    raw_call = str((item.get('id') if invocation else item.get('tool_use_id')) or '')
+                    call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
+                    entry['call_id'] = call or None
+                    if invocation and call:
+                        if len(state.pending) < 128:
+                            state.pending[call] = {'source_ref': entry['source_ref'], 'call_id': call}
+                        else:
+                            state.call_omitted += 1
+                    elif not invocation:
+                        matched = state.pending.pop(call, None) if call else None
+                        entry['invocation_ref'] = matched['source_ref'] if matched else None
+                        entry['native_is_error'] = item.get('is_error')
+                    admit(state, entry, retained_limit)
+                    state.after_anchor += 1
+                    if not timestamp:
+                        state.temporal_complete = False
+                        state.untimed += 1
+            # Mixed tool content remains structurally classified from raw data;
+            # only actual text blocks can become assistant narrative excerpts.
+            record.text = text_from_item([item for item in content if isinstance(item, dict) and item.get('type') == 'text'])
         if not record.text.strip():
             continue
         signature = (classification.label, hashlib.sha256(record.text.encode()).hexdigest())
@@ -319,6 +358,7 @@ def display_entries(entries, allowance, contexts, path):
                 start = len(text.encode())
                 text += piece['text'] + '\n'
                 references.append({'line': piece['source_ref']['line'], 'kind': piece['kind'],
+                    **({'content_index': piece['source_ref']['content_index']} if 'content_index' in piece['source_ref'] else {}),
                     'display_text_byte_start': start, 'display_text_byte_end': len(text.encode()) - 1,
                     'native_spans': [{k: v for k, v in s.items() if k != 'text'} for s in piece['spans']],
                     'text_complete': piece['text_complete'], 'invocation_ref': piece.get('invocation_ref')})
