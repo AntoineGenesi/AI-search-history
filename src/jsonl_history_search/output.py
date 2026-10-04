@@ -578,8 +578,11 @@ def render_history_evidence(payload: dict) -> str:
         lines.append('Supported chronology complete: ' + str(payload['coverage']['complete']))
         anchor = chronology.get('anchor')
         if anchor:
-            lines.append('Human boundary: %s | %s | %s' % (ref_target(anchor['source_ref']), anchor['timestamp'], anchor['text']))
+            label = 'Human boundary candidate' if (chronology.get('request_boundary') or {}).get('status') == 'uncertain' else 'Human boundary'
+            lines.append('%s: %s | %s | %s' % (label, ref_target(anchor['source_ref']), anchor['timestamp'], anchor['text']))
         lines.append('Time uncertainty: ' + str(not chronology['temporal_complete']))
+        if chronology.get('request_boundary'):
+            lines.append('Request boundary: ' + json.dumps(chronology['request_boundary'], ensure_ascii=False))
         artifact = chronology.get('interval_artifact')
         if artifact:
             lines.extend(['Read the report as plain text: ' + artifact['path'],

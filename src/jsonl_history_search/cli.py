@@ -3218,7 +3218,8 @@ def main(argv: list[str] | None = None) -> int:
         from .history_answer import is_direct_latest_message_history_query, retrieve_chronological_evidence
         default_tz = timezone_from_args(args.timezone, args.timezone_offset)
         operation = retrieve_chronological_evidence if is_direct_latest_message_history_query(args.query) else retrieve_history_evidence
-        extra = {'cutoff': parse_now(_source_plan['now'], default_tz), 'requested_cwd': args.cwd} if operation is retrieve_chronological_evidence else {}
+        extra = {'cutoff': parse_now(_source_plan['now'], default_tz), 'requested_cwd': args.cwd,
+                 'live_request': args.now is None} if operation is retrieve_chronological_evidence else {}
         payload = operation(query=args.query, intent=intent, plan=plan,
             default_tz=default_tz, budget=budget,
             mask_context=_mask_context_from_args(args), output_format=args.format, **extra)

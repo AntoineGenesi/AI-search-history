@@ -67,6 +67,64 @@ class NativeSession:
     clipped: int = 0
     pending: dict = field(default_factory=dict)
     call_omitted: int = 0
+    open_turn: str | None = None
+    open_turn_ref: dict | None = None
+    closed_turn: str | None = None
+    turn_conflict: bool = False
+    previous_interval: dict | None = None
+    request_candidate: dict | None = None
+    request_boundary: dict | None = None
+    boundary_complete: bool = True
+
+
+INTERVAL_FIELDS = ('anchor', 'anchor_time', 'entries', 'pending', 'retained_cost',
+                   'after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped')
+
+
+def resolve_request_boundary(state, request_turn, live_request):
+    candidate, prior = state.request_candidate, state.previous_interval
+    if not candidate:
+        return
+    turn = candidate['turn']
+    explicit = bool(request_turn and turn == request_turn and not state.turn_conflict)
+    inferred = bool(live_request and state.complete and turn and state.open_turn == turn
+                    and state.open_turn_ref and not state.turn_conflict)
+    closed = bool(turn and state.closed_turn == turn and not state.open_turn and not state.turn_conflict)
+    state.request_boundary = {'request_ref': candidate['anchor']['source_ref'],
+        'mirror_lines': candidate['anchor'].get('native_mirror_lines', []),
+        'start_ref': state.open_turn_ref,
+        'basis': 'environment turn corroborated by native occurrence' if explicit else
+                 'owned session, terminal native open turn and exact request' if inferred else
+                 'native turn completed; historical human retained' if closed else
+                 'conflicting native live-turn identity' if state.turn_conflict else
+                 'native source inspection incomplete' if not state.complete else
+                 'native live open-turn identity unavailable',
+        'status': 'excluded_current_request' if explicit or inferred else 'historical_human' if closed else 'uncertain'}
+    if explicit or inferred:
+        if prior:
+            for field in INTERVAL_FIELDS:
+                setattr(state, field, prior[field])
+        else:
+            state.anchor = None
+            state.entries, state.pending, state.retained_cost = [], {}, 0
+    elif closed or not live_request:
+        if prior:
+            state.retained_cost -= prior['retained_cost']
+    else:
+        # Keep attributable prior/current facts, not an empty confident recap.
+        # Both lists were admitted against one retained_cost, never two grants.
+        state.boundary_complete = False
+        if prior:
+            state.anchor, state.anchor_time = prior['anchor'], prior['anchor_time']
+            state.entries = prior['entries'] + state.entries
+            for call, value in prior['pending'].items():
+                if call not in state.pending and len(state.pending) < 128:
+                    state.pending[call] = value
+                elif call not in state.pending:
+                    state.call_omitted += 1
+            for field in ('after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped'):
+                setattr(state, field, getattr(state, field) + prior[field])
+    state.previous_interval = None
 
 
 def excerpt(record, *, kind, mask_context, text=None, limit=4096):
@@ -115,7 +173,7 @@ def admit(state, entry, limit):
 
 
 def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context,
-                 retained_limit, request_session, request_turn):
+                 retained_limit, request_session, request_turn, query, live_request):
     if not state.path.stat().st_mode & 0o444:
         raise PermissionError('source has no read permission bits')
     for record in iter_records_for_file(state.path, kind, default_tz,
@@ -157,24 +215,37 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             state.parent = str(edge) if edge else None
             state.controls += 1
             continue
-        if top == 'turn_context':
-            state.current_turn = body.get('turn_id')
-            state.controls += 1
-            if state.anchor and (not record.timestamp or record.timestamp <= cutoff):
-                state.interval_raw_records += 1
-            continue
-        if event == 'task_started' and body.get('turn_id'):
-            state.current_turn = body['turn_id']
         timestamp = record.timestamp.astimezone(timezone.utc) if record.timestamp else None
         if timestamp and state.last_time and timestamp < state.last_time:
             state.temporal_complete = False
             state.reversed += 1
         if timestamp:
             state.last_time = timestamp
-        # Parse to EOF: later native rows can be backdated across the cutoff.
+        # As-of filtering precedes lifecycle: future metadata is not authority.
         if timestamp and timestamp > cutoff:
             state.future += 1
             continue
+        if top == 'turn_context':
+            state.current_turn = body.get('turn_id')
+            if state.open_turn and state.current_turn and state.current_turn != state.open_turn:
+                state.turn_conflict = True
+            state.controls += 1
+            if state.anchor and (not record.timestamp or record.timestamp <= cutoff):
+                state.interval_raw_records += 1
+            continue
+        if event == 'task_started' and body.get('turn_id'):
+            if state.open_turn and state.open_turn != body['turn_id']:
+                state.turn_conflict = True
+            elif not state.open_turn:
+                state.turn_conflict = False
+            state.open_turn = body['turn_id']
+            state.open_turn_ref = evidence_ref(record)
+            state.current_turn = body['turn_id']
+        if event in {'task_complete', 'task_completed', 'turn_aborted'} and body.get('turn_id'):
+            if state.open_turn == body['turn_id']:
+                state.closed_turn, state.open_turn = state.open_turn, None
+            elif state.open_turn:
+                state.turn_conflict = True
         if state.anchor:
             state.interval_raw_records += 1
         classification = classify_conversation_record(record)
@@ -240,9 +311,18 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         claude_plain_human = (claude and top == 'user' and raw['message'].get('role') == 'user'
                               and isinstance(content, str) and bool(content.strip()))
         human = (classification.is_human_authored or claude_plain_human) and not state.worker
-        is_current = (request_session and request_turn and state.session == request_session
-                      and (body.get('turn_id') or state.current_turn) == request_turn)
-        if human and not is_current:
+        if human:
+            native_turn = body.get('turn_id') or state.current_turn
+            if state.open_turn and native_turn and native_turn != state.open_turn:
+                state.turn_conflict = True
+            if state.previous_interval:
+                state.retained_cost -= state.previous_interval['retained_cost']
+                state.previous_interval = None
+            owned = bool(request_session and state.session == request_session)
+            candidate = owned and ((live_request and record.text == query)
+                or (request_turn and native_turn == request_turn))
+            if candidate and state.anchor:
+                state.previous_interval = {field: getattr(state, field) for field in INTERVAL_FIELDS}
             if not timestamp:
                 state.temporal_complete = False
                 state.untimed += 1
@@ -250,11 +330,13 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             # untimed rows retain their explicit temporal uncertainty.
             state.anchor = excerpt(record, kind='human_message_start', mask_context=mask_context)
             state.anchor_time = timestamp
-            state.entries.clear()
-            state.pending.clear()
-            state.retained_cost = state.after_anchor = state.interval_raw_records = state.retention_omitted = state.clipped = 0
+            state.request_candidate = {'anchor': state.anchor, 'turn': native_turn} if candidate else None
+            state.entries, state.pending = [], {}
+            if not state.previous_interval:
+                state.retained_cost = 0
+            state.after_anchor = state.interval_raw_records = state.retention_omitted = state.clipped = 0
             continue
-        if not state.anchor or is_current:
+        if not state.anchor:
             continue
         state.after_anchor += 1
         if not timestamp:
@@ -292,7 +374,7 @@ def report_ref(ref):
 
 
 def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_complete,
-                      temporal_complete, pending, masked, budget):
+                      temporal_complete, pending, masked, budget, request_boundary=None):
     """One structural union, serialized once; no topic ranking or source reread."""
     def key(ref):
         return ref['line'], ref.get('content_index', -1)
@@ -324,6 +406,10 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
             anchor['source_ref']['path'], scope, scope == 'proven_parent', report_ref(anchor['source_ref']),
             anchor['text'], cutoff.isoformat(), source_complete, temporal_complete,
             json.dumps(omissions, separators=(',', ':')), bool(masked))
+    if request_boundary:
+        if request_boundary['status'] == 'uncertain':
+            header = header.replace('Human boundary:', 'Human boundary candidate:', 1)
+        header += 'Request boundary: ' + json.dumps(request_boundary, separators=(',', ':')) + '\n\n'
     blocks, emitted_classes = [], {}
     for ref, entry in sorted(selected.items()):
         budget.check('chronology_report')
@@ -377,10 +463,10 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
 
 
 def retain_interval(entries, anchor, *, cutoff, omissions, scope, source_complete,
-                    temporal_complete, pending, masked, budget):
+                    temporal_complete, pending, masked, budget, request_boundary=None):
     data, projection = chronology_report(entries, anchor, cutoff=cutoff, omissions=omissions,
         scope=scope, source_complete=source_complete, temporal_complete=temporal_complete,
-        pending=pending, masked=masked, budget=budget)
+        pending=pending, masked=masked, budget=budget, request_boundary=request_boundary)
     budget.check('chronology_report')
     directory = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'jsonl-history-search' / 'interval-evidence'
     # Check existing ancestors before creating anything: a rejected link must
@@ -485,7 +571,7 @@ def display_entries(entries, allowance, contexts, path):
 
 
 def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
-                                  cutoff, requested_cwd=None, mask_context=None, output_format='json'):
+                                  cutoff, requested_cwd=None, mask_context=None, output_format='json', live_request=False):
     cutoff = cutoff.astimezone(timezone.utc)
     files = list(enumerate_jsonl_files(plan, budget=budget, measured_byte_admission=True))
     states, errors, stats = [], [], RawLineScanStats()
@@ -502,13 +588,15 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         try:
             scan_session(state, kind=kind, default_tz=default_tz, budget=budget, stats=stats,
                 cutoff=cutoff, mask_context=mask_context, retained_limit=retained_limit,
-                request_session=request_session, request_turn=request_turn)
+                request_session=request_session, request_turn=request_turn, query=query, live_request=live_request)
             if state.records and not state.session:
                 state.anchor = None
                 state.entries.clear()
                 errors.append({'path': str(path), 'reason': 'native owning session/worker provenance unavailable; provider chronology unsupported'})
         except (OSError, ValueError, TypeError) as exc:
             errors.append({'path': str(path), 'reason': str(exc)})
+        finally:
+            resolve_request_boundary(state, request_turn, live_request)
         if not budget.available('chronology'):
             break
     errors.extend(stats.partial_failures or [])
@@ -523,7 +611,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
     source_complete = not (caps or errors or unavailable or len(states) != len(files) or any(not s.complete for s in states))
     temporal = bool(chosen and chosen.temporal_complete)
-    complete = source_complete and temporal and chosen is not None
+    complete = source_complete and temporal and chosen is not None and chosen.boundary_complete
     if chosen and requested_cwd and chosen.cwd and Path(chosen.cwd).resolve() != Path(requested_cwd).resolve():
         complete = False
         errors.append({'reason': 'selected native session cwd differs from caller cwd; useful selected-source evidence is returned without parent verification'})
@@ -536,7 +624,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         try:
             artifact = retain_interval(entries, chosen.anchor, cutoff=cutoff, omissions=omissions,
                 scope=scope, source_complete=source_complete, temporal_complete=temporal,
-                pending=chosen.pending, masked=mask_context, budget=budget)
+                pending=chosen.pending, masked=mask_context, budget=budget, request_boundary=chosen.request_boundary)
         except OSError as exc:
             errors.append({'reason': 'interval artifact unavailable: ' + str(exc)})
         caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
@@ -568,6 +656,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             'source_error_count': len(errors), 'cap_reasons': caps,
             'unavailable_roots': [clip(p, 2048) for p in unavailable[:20]]},
         'chronology': {'scope': scope, 'anchor': chosen.anchor if chosen else None,
+            'request_boundary': chosen.request_boundary if chosen else requesting[0].request_boundary if len(requesting) == 1 else None,
             'parent_relationship_verified': scope == 'proven_parent',
             'candidate_anchors': [],
             'temporal_complete': temporal, 'cutoff': cutoff.isoformat(),
