@@ -260,9 +260,9 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if claude:
             owner = raw.get('sessionId')
             if not isinstance(owner, str) or not owner or not isinstance(raw.get('isSidechain'), bool):
-                raise ValueError('Claude native session/sidechain ownership unavailable')
+                raise (NativeTargetIntegrityError if expected_identity else ValueError)('Claude native session/sidechain ownership unavailable')
             if not isinstance(raw.get('message'), dict):
-                raise ValueError('Claude native message shape unavailable')
+                raise (NativeTargetIntegrityError if expected_identity else ValueError)('Claude native message shape unavailable')
             if state.session and (state.session != owner or state.worker != raw['isSidechain']):
                 raise (NativeTargetIntegrityError if expected_identity else ValueError)('conflicting Claude native session/sidechain ownership')
             if expected_identity and (owner, raw['isSidechain'], None, False) != expected_identity:
