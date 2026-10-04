@@ -27,6 +27,10 @@ SOURCE_EXPANSION_TEXT_RECORD_HEADER_RE = re.compile(
 
 def render_json(payload: dict) -> str:
     safe_payload = _semantic_debug_cap_hit_json_projection(payload)
+    if payload.get('chronology'):
+        # Native per-piece mappings should not spend the excerpt allowance on
+        # indentation. The same complete JSON data remains directly readable.
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     return json.dumps(safe_payload or payload, indent=2, ensure_ascii=False, sort_keys=True)
 
 
@@ -255,8 +259,6 @@ def render_text(payload: dict) -> str:
         return render_history_evidence(payload)
     if "retained_source_read" in payload:
         return render_retained_source_read_text(payload)
-    if "ask_answer" in payload:
-        return render_ask_answer_text(payload)
     if "bulk_line_match" in payload:
         return render_bulk_line_match_text(payload)
     if "failure_analysis" in payload:
@@ -444,8 +446,6 @@ def render_markdown(payload: dict) -> str:
         return render_history_evidence(payload)
     if "retained_source_read" in payload:
         return render_retained_source_read_markdown(payload)
-    if "ask_answer" in payload:
-        return render_ask_answer_markdown(payload)
     if "bulk_line_match" in payload:
         return render_bulk_line_match_markdown(payload)
     if "failure_analysis" in payload:
@@ -758,101 +758,12 @@ def render_bulk_line_match_text(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def render_ask_answer_text(payload: dict) -> str:
-    report = payload["ask_answer"]
-    route = report.get("selected_route") or {}
-    lines = [
-        "Ask Answer",
-        f"Query: {report.get('query')}",
-        f"Route family: {route.get('route_family')}",
-        f"Answer status: {report.get('answer_status')}",
-    ]
-    if report.get("answer"):
-        lines.append(f"Answer: {report.get('answer')}")
-    if report.get("fail_closed_reason"):
-        lines.append(f"Cannot answer directly yet: {report.get('fail_closed_reason')}")
-    refs = report.get("refs_used") or []
-    if refs:
-        lines.append("Refs used:")
-        for item in refs:
-            bits = [str(item.get("target") or "(unknown target)")]
-            if item.get("kind"):
-                bits.append(f"kind={item.get('kind')}")
-            if item.get("proof_surface"):
-                bits.append(f"proof_surface={item.get('proof_surface')}")
-            if item.get("target_source_role"):
-                bits.append(f"target_source_role={item.get('target_source_role')}")
-            lines.append(f"- {'; '.join(bits)}")
-    proof = report.get("proof_summary") or []
-    if proof:
-        lines.append("Proof summary:")
-        for item in proof:
-            lines.append(f"- {item}")
-    if report.get("next_proof_step"):
-        lines.append(f"Next proof step: {report.get('next_proof_step')}")
-    source_contract = report.get("source_contract") or {}
-    if source_contract:
-        lines.append(
-            "Source contract: "
-            f"{source_contract.get('built_from')} "
-            f"answer_action_status={source_contract.get('answer_action_status')} "
-            f"promotion_status={source_contract.get('promotion_status')}"
-        )
-        if source_contract.get("built_from") == "direct_history_evidence":
-            _append_ordinary_evidence_contract(lines, source_contract)
-    return "\n".join(lines)
-
-
-def _append_ordinary_evidence_contract(lines, contract):
-    lines.append("Coverage: " + json.dumps(contract.get("coverage", {}), sort_keys=True))
-    lines.append("Output omissions: " + json.dumps(contract.get("output_omissions", {}), sort_keys=True))
-    for label, key in (("Source error", "source_errors"), ("Evidence gap", "recoverable_gaps")):
-        for item in contract.get(key, []):
-            lines.append(label + ": " + json.dumps(item, sort_keys=True))
-    lines.append("Boundary: " + contract.get("claim_boundary", "bounded source evidence"))
 
 
 
 
-def render_ask_answer_markdown(payload: dict) -> str:
-    report = payload["ask_answer"]
-    route = report.get("selected_route") or {}
-    lines = [
-        "# JSONL Ask Answer",
-        "",
-        f"- Query: `{report.get('query')}`",
-        f"- Route family: `{route.get('route_family')}`",
-        f"- Answer status: `{report.get('answer_status')}`",
-    ]
-    if report.get("answer"):
-        lines.extend(["", "## Answer", "", str(report.get("answer"))])
-    if report.get("fail_closed_reason"):
-        lines.extend(["", "## Cannot Answer Directly Yet", "", str(report.get("fail_closed_reason"))])
-    refs = report.get("refs_used") or []
-    if refs:
-        lines.extend(["", "## Refs Used"])
-        for item in refs:
-            target = item.get("target") or "(unknown target)"
-            details = []
-            for key in ("kind", "proof_surface", "target_source_role"):
-                if item.get(key):
-                    details.append(f"{key}=`{item.get(key)}`")
-            suffix = f" ({', '.join(details)})" if details else ""
-            lines.append(f"- `{target}`{suffix}")
-    proof = report.get("proof_summary") or []
-    if proof:
-        lines.extend(["", "## Proof Summary"])
-        for item in proof:
-            lines.append(f"- {item}")
-    if report.get("next_proof_step"):
-        lines.extend(["", "## Next Proof Step", "", f"`{report.get('next_proof_step')}`"])
-    source_contract = report.get("source_contract") or {}
-    if source_contract.get("built_from") == "direct_history_evidence":
-        details = []
-        _append_ordinary_evidence_contract(details, source_contract)
-        lines.extend(["", "## Evidence Coverage", ""])
-        lines.extend(f"- {item}" for item in details)
-    return "\n".join(lines)
+
+
 
 
 def render_bulk_line_match_markdown(payload: dict) -> str:

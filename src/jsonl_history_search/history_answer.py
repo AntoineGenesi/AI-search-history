@@ -125,6 +125,8 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if raw.get('inherited') or body.get('inherited') or body.get('is_replay'):
             state.controls += 1
             continue
+        if state.session and body.get('thread_id') and str(body['thread_id']) != state.session:
+            raise ValueError('native event thread conflicts with owning session')
         if top == 'session_meta':
             owner = str(body.get('id') or body.get('session_id') or '')
             if state.session:
@@ -177,6 +179,16 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         state.last_transport = (record.line, signature, top, proof)
         if mirror:
             state.mirrors += 1
+            original = state.entries[-1] if state.entries and state.entries[-1]['source_ref']['line'] == previous[0] else state.anchor if state.anchor and state.anchor['source_ref']['line'] == previous[0] else None
+            if original is not None:
+                before = len(encoded(original))
+                original['native_mirror_lines'] = [record.line]
+                extra = len(encoded(original)) - before
+                if original is state.anchor or state.retained_cost + extra <= retained_limit:
+                    if original is not state.anchor:
+                        state.retained_cost += extra
+                else:
+                    original.pop('native_mirror_lines', None)
             continue
         human = classification.is_human_authored and not state.worker
         is_current = (request_session and request_turn and state.session == request_session
