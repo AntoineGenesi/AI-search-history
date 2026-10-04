@@ -25,6 +25,10 @@ The same ask handles latest-message recaps with native human boundaries and
 chronological tool outcomes. Read the returned scope and human boundary: a selected session
 does not prove its relationship to a requesting side thread. Parent identity
 requires a native parent edge. Never infer a human anchor from lexical rank.
+No-root recaps currently need CODEX_THREAD_ID or CODEX_SESSION_ID verified against
+native ownership. Without that identity, use an authorized explicit `--root`
+for selected-source evidence, not verified live-requester or parent scope.
+Cross-provider ordinary history search remains available.
 For a recap, read the returned report path as ordinary plain text; no JSON parser
 is needed. Its header binds native line refs to the selected source. The report
 uses the existing4MiB retained-payload bound, including framing; this is not a
