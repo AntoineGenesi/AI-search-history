@@ -84,6 +84,61 @@ class NativeSession:
     request_candidate: dict | None = None
     request_boundary: dict | None = None
     boundary_complete: bool = True
+    parent_conflict: bool = False
+
+
+def native_metadata_identity(body):
+    owners = {body[k] for k in ('id', 'session_id') if isinstance(body.get(k), str) and body[k]}
+    if len(owners) != 1:
+        raise ValueError('native owning session identity missing or conflicting')
+    source = body.get('source')
+    subagent = source.get('subagent') if isinstance(source, dict) else None
+    spawn = subagent.get('thread_spawn') if isinstance(subagent, dict) else None
+    edges = [body.get('parent_thread_id'), body.get('parent_session_id')]
+    if isinstance(spawn, dict):
+        edges.append(spawn.get('parent_thread_id'))
+    present = [e for e in edges if e is not None]
+    conflict = any(not isinstance(e, str) or not e for e in present) or len(set(e for e in present if isinstance(e, str))) > 1
+    worker = body.get('thread_source') == 'subagent' or (isinstance(source, dict) and 'subagent' in source) or body.get('agent_role') in {'worker', 'reviewer'}
+    return next(iter(owners)), worker, present[0] if present and not conflict else None, conflict
+
+
+def discover_native_sessions(files, *, plan, budget, default_tz):
+    """Complete owning record only; every header read shares the body budget."""
+    metadata, errors, stats = [], [], RawLineScanStats()
+    for path, _, _ in files:
+        kind = source_kind_for_path(path, plan)
+        if path.suffix.lower() != '.jsonl' or kind.startswith(('grok_', 'gemini_', 'aider_', 'cursor_', 'opencode_')):
+            errors.append({'path': str(path), 'reason': 'native metadata target discovery unsupported'})
+            continue
+        records = iter_records_for_file(path, kind, default_tz, raw_line_stats=stats,
+                                       budget=budget, budget_phase='chronology_metadata')
+        try:
+            if not path.stat().st_mode & 0o444:
+                raise PermissionError('source has no read permission bits')
+            record = next(records)
+            raw, body = record.raw or {}, native_message_payload(record.raw or {})
+            if not isinstance(body, dict) or raw.get('inherited') or body.get('inherited') or body.get('is_replay'):
+                raise ValueError('native owning metadata unavailable')
+            if raw.get('type') == 'session_meta':
+                owner, worker, parent, conflict = native_metadata_identity(body)
+                state = NativeSession(path, session=owner, worker=worker, parent=parent,
+                                      parent_conflict=conflict, cwd=body.get('cwd'))
+            elif raw.get('type') in {'user', 'assistant'} and isinstance(raw.get('sessionId'), str) and isinstance(raw.get('isSidechain'), bool):
+                state = NativeSession(path, session=raw['sessionId'], worker=raw['isSidechain'], cwd=raw.get('cwd'))
+            else:
+                raise ValueError('native owning metadata unavailable')
+            metadata.append(state)
+            if state.parent_conflict:
+                errors.append({'path': str(path), 'reason': 'conflicting native direct-parent metadata'})
+        except (StopIteration, OSError, ValueError, TypeError) as exc:
+            errors.append({'path': str(path), 'reason': str(exc) or 'native metadata source empty'})
+        finally:
+            records.close()
+        if not budget.available('chronology_metadata'):
+            break
+    errors.extend(stats.partial_failures or [])
+    return metadata, errors
 
 
 INTERVAL_FIELDS = ('anchor', 'anchor_time', 'entries', 'pending', 'retained_cost',
@@ -211,18 +266,16 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if state.session and body.get('thread_id') and str(body['thread_id']) != state.session:
             raise ValueError('native event thread conflicts with owning session')
         if top == 'session_meta':
-            owner = str(body.get('id') or body.get('session_id') or '')
+            owner, worker, parent, conflict = native_metadata_identity(body)
             if state.session:
-                if owner != state.session:
+                if owner != state.session or worker != state.worker:
                     raise ValueError('conflicting native session ownership metadata')
+                if conflict or parent != state.parent:
+                    state.parent, state.parent_conflict = None, True
                 continue
             state.session = owner
             state.cwd = body.get('cwd')
-            source = body.get('source')
-            state.worker = body.get('thread_source') == 'subagent' or (
-                isinstance(source, dict) and 'subagent' in source) or body.get('agent_role') in {'worker', 'reviewer'}
-            edge = body.get('parent_thread_id') or body.get('parent_session_id')
-            state.parent = str(edge) if edge else None
+            state.worker, state.parent, state.parent_conflict = worker, parent, conflict
             state.controls += 1
             continue
         timestamp = record.timestamp.astimezone(timezone.utc) if record.timestamp else None
@@ -588,14 +641,33 @@ def display_entries(entries, allowance, contexts, path):
 
 
 def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
-                                  cutoff, requested_cwd=None, mask_context=None, output_format='json', live_request=False):
+                                  cutoff, requested_cwd=None, mask_context=None, output_format='json', live_request=False,
+                                  explicit_roots=True):
     cutoff = cutoff.astimezone(timezone.utc)
     files = list(enumerate_jsonl_files(plan, budget=budget, measured_byte_admission=True))
     states, errors, stats = [], [], RawLineScanStats()
     request_session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CODEX_SESSION_ID')
     request_turn = os.environ.get('CODEX_TURN_ID')
-    retained_limit = max(0, RETAIN_LIMIT // max(1, len(files)) - 8192)
-    for path, _, _ in files:
+    discovery_errors, metadata = [], []
+    target, target_scope = None, None
+    parent_requested = bool(re.search(r'\b(?:parent|main)\s+(?:thread|session)\b', query.lower()))
+    if not explicit_roots:
+        metadata, discovery_errors = discover_native_sessions(files, plan=plan, budget=budget, default_tz=default_tz)
+        owners = [s for s in metadata if request_session and s.session == request_session]
+        if len(owners) == 1:
+            owner = owners[0]
+            target, target_scope = owner, 'requesting_session'
+            if parent_requested:
+                parents = [s for s in metadata if owner.parent and s.session == owner.parent and not s.worker]
+                if len(parents) == 1 and not owner.parent_conflict:
+                    target, target_scope = parents[0], 'proven_parent'
+                else:
+                    target_scope = 'unverified_parent'
+                    discovery_errors.append({'reason': 'requested native parent missing, conflicting or unavailable; own-session candidate activity only'})
+        else:
+            discovery_errors.append({'reason': 'requesting native owner missing or conflicting; no unique target verified'})
+    scan_files = [f for f in files if f[0] == target.path] if target else files
+    for path, _, _ in scan_files:
         state = NativeSession(path=path)
         states.append(state)
         kind = source_kind_for_path(path, plan)
@@ -603,6 +675,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             errors.append({'path': str(path), 'reason': 'native session boundary/ordering unsupported; ordinary provider retrieval remains available'})
             continue
         try:
+            retained_limit = max(0, RETAIN_LIMIT - 8192 - sum(s.retained_cost for s in states))
             scan_session(state, kind=kind, default_tz=default_tz, budget=budget, stats=stats,
                 cutoff=cutoff, mask_context=mask_context, retained_limit=retained_limit,
                 request_session=request_session, request_turn=request_turn, query=query, live_request=live_request)
@@ -614,6 +687,8 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             errors.append({'path': str(path), 'reason': str(exc)})
         finally:
             resolve_request_boundary(state, request_turn, live_request)
+        if state.parent_conflict:
+            errors.append({'path': str(path), 'reason': 'conflicting native direct-parent metadata'})
         if not budget.available('chronology'):
             break
     errors.extend(stats.partial_failures or [])
@@ -623,12 +698,20 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     parents = [s for s in candidates if s.session == parent] if parent else []
     scope = 'proven_parent' if len(parents) == 1 else 'selected_session' if len(candidates) == 1 and not parent else 'ambiguous_sessions' if candidates else 'unavailable_session'
     chosen = parents[0] if scope == 'proven_parent' else candidates[0] if scope == 'selected_session' else None
+    if not explicit_roots:
+        chosen = states[0] if target and states and states[0].anchor else None
+        scope = target_scope if chosen else 'ambiguous_sessions' if candidates else 'unavailable_session'
+        if not target:
+            chosen = None
     unavailable = [str(r.path) for r in plan.roots if not r.path.exists()]
     unavailable.extend(str(r.path) for r in plan.rejected_roots)
     caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
-    source_complete = not (caps or errors or unavailable or len(states) != len(files) or any(not s.complete for s in states))
+    discovery_complete = not (caps or discovery_errors) if not explicit_roots else None
+    source_complete = not (caps or errors or (unavailable if explicit_roots else []) or len(states) != len(scan_files) or any(not s.complete for s in states))
     temporal = bool(chosen and chosen.temporal_complete)
     complete = source_complete and temporal and chosen is not None and chosen.boundary_complete
+    if not explicit_roots:
+        complete = complete and bool(discovery_complete) and scope in {'requesting_session', 'proven_parent'}
     if chosen and requested_cwd and chosen.cwd and Path(chosen.cwd).resolve() != Path(requested_cwd).resolve():
         complete = False
         errors.append({'reason': 'selected native session cwd differs from caller cwd; useful selected-source evidence is returned without parent verification'})
@@ -647,7 +730,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
     if artifact and artifact['omitted_records']:
         omissions['artifact_records'] = artifact['omitted_records']
-    if parent and not parents:
+    if explicit_roots and parent and not parents:
         errors.append({'reason': 'native requesting-side parent is outside or unavailable in admitted scope'})
         complete = False
     limit = max(0, min(30, plan.limits.max_matches))
@@ -668,9 +751,11 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             'root_count': len(plan.roots), 'roots_display_complete': len(plan.roots) <= 20,
             'cutoff': cutoff.isoformat()},
         'coverage': {'complete': complete, 'source_complete': source_complete, 'files_admitted': len(files),
+            **({'discovery_complete': discovery_complete, 'metadata_records_verified': len(metadata),
+                'target_resolution': target_scope or 'unresolved'} if not explicit_roots else {}),
             'files_read': len(budget.opened_sources), 'records_inspected': sum(s.records for s in states),
-            'source_errors': [{k: clip(str(v), 1024) for k, v in e.items()} for e in errors[:20]],
-            'source_error_count': len(errors), 'cap_reasons': caps,
+            'source_errors': [{k: clip(str(v), 1024) for k, v in e.items()} for e in (errors + discovery_errors)[:20]],
+            'source_error_count': len(errors) + len(discovery_errors), 'cap_reasons': caps,
             'unavailable_roots': [clip(p, 2048) for p in unavailable[:20]]},
         'chronology': {'scope': scope, 'anchor': chosen.anchor if chosen else None,
             'request_boundary': chosen.request_boundary if chosen else requesting[0].request_boundary if len(requesting) == 1 else None,
