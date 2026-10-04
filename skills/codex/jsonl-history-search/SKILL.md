@@ -25,8 +25,9 @@ does not prove its relationship to a requesting side thread. Parent identity
 requires a native parent edge. Never infer a human anchor from lexical rank.
 For a recap, read the returned report path as ordinary plain text; no JSON parser
 is needed. Its header binds native line refs to the selected source. The report
-is at most384KiB, separate from the small console handoff and the4MiB retention
-cap. Check its final END OF BOUNDED CHRONOLOGY REPORT marker; if a read truncates,
+uses the existing4MiB retained-payload bound, including framing; this is not a
+total-RAM bound or automatic model-read allowance. Read only within the authorized
+delivery/context allowance. Check its END OF BOUNDED CHRONOLOGY REPORT marker; if a read truncates,
 use bounded contiguous file ranges within the authorized delivery allowance or
 name the gap. Source, temporal, retained and projection completeness differ.
 Reports are unverified assistant claims; returned outputs and paired invocation

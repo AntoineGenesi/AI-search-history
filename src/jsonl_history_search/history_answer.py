@@ -23,8 +23,6 @@ from .records import text_from_item, native_message_payload
 from .source_refs import evidence_ref
 from .sources import cap_labels_from_warnings, enumerate_jsonl_files, source_kind_for_path
 
-REPORT_LIMIT = 393216
-
 
 def is_direct_latest_message_history_query(query):
     text = ' '.join(query.lower().split())
@@ -366,16 +364,16 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
                     not omitted, count, len(blocks), json.dumps(excluded, separators=(',', ':')), ranges or 'none')).encode()
     data = header.encode()
     count, size = len(blocks), len(data) + sum(len(block) for _, _, block in blocks)
-    while count and size + len(footer(count)) > REPORT_LIMIT:
+    while count and size + len(footer(count)) > RETAIN_LIMIT:
         count -= 1
         size -= len(blocks[count][2])
     tail = footer(count)
-    if size + len(tail) > REPORT_LIMIT:
+    if size + len(tail) > RETAIN_LIMIT:
         raise OSError('chronology report framing exceeds report allowance')
     return data + b''.join(block for _, _, block in blocks[:count]) + tail, {
         'records': count, 'union_records': len(blocks), 'omitted_records': len(blocks) - count,
         'projection_complete': count == len(blocks), 'selected_classes': emitted_classes,
-        'retained_classes': classes, 'limit_bytes': REPORT_LIMIT}
+        'retained_classes': classes, 'limit_bytes': RETAIN_LIMIT}
 
 
 def retain_interval(entries, anchor, *, cutoff, omissions, scope, source_complete,
