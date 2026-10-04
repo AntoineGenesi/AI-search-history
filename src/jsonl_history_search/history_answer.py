@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 
 from .adapters import RawLineScanStats, iter_records_for_file
@@ -18,7 +19,7 @@ from .conversation_records import (ASSISTANT_OR_AGENT_MESSAGE, COMPACTED_HISTORY
     INJECTED_ENVIRONMENT_CONTEXT, SUBAGENT_NOTIFICATION, TURN_CONTROL_OR_STATUS,
     classify_conversation_record)
 from .history_evidence import TEXT_LIMIT, RESPONSE_LIMIT, RETAIN_LIMIT
-from .records import text_from_item
+from .records import text_from_item, native_message_payload
 from .source_refs import evidence_ref
 from .sources import cap_labels_from_warnings, enumerate_jsonl_files, source_kind_for_path
 
@@ -55,6 +56,7 @@ class NativeSession:
     controls: int = 0
     mirrors: int = 0
     after_anchor: int = 0
+    interval_raw_records: int = 0
     future: int = 0
     untimed: int = 0
     reversed: int = 0
@@ -77,13 +79,14 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
         'timestamp_quality': record.timestamp_quality, 'kind': kind,
         'speaker': 'assistant' if kind == 'reported_claim' else 'tool' if kind.startswith('tool_') else 'user',
         'text': clip(text, limit), 'text_complete': original <= limit, 'original_text_bytes': original}
-    if original > limit and kind == 'tool_result':
+    if kind == 'tool_result':
         # Exact returned process/git disposition lines may occur anywhere in a
         # long output; retain byte offsets, not an invented outcome summary.
         spans, offset = [], 0
         for line in text.splitlines(keepends=True):
-            if re.match(r'\s*(?:\[[^\]\n]+ [0-9a-f]{7,40}\]|Process exited with|Exit code:|Session ID|Script running with cell ID|\d+ files? changed)', line):
-                spans.append({'text_byte_start': offset, 'text': clip(line.rstrip(), 1024)})
+            if re.match(r'\s*(?:\[[^\]\n]+ [0-9a-f]{7,40}\]|Process exited with code [1-9]|Exit code: [1-9]|Session ID|Script running with cell ID|\d+ files? changed)', line):
+                span_text = clip(line.rstrip(), 1024)
+                spans.append({'text_byte_start': offset, 'text_byte_end': offset + len(span_text.encode()), 'text': span_text})
                 if len(spans) >= 16:
                     break
             offset += len(line.encode())
@@ -93,7 +96,12 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
 
 
 def admit(state, entry, limit):
-    cost = len(encoded(entry))
+    # All interval records bind to this session's single physical source. Store
+    # that identity once in the artifact header rather than thousands of times.
+    entry['source_ref'] = {'line': entry['source_ref']['line']}
+    if entry.get('invocation_ref'):
+        entry['invocation_ref'] = {'line': entry['invocation_ref']['line']}
+    cost = len(encoded(entry)) + 1
     if state.retained_cost + cost > limit:
         state.retention_omitted += 1
         return
@@ -110,12 +118,20 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             raw_line_stats=stats, budget=budget, budget_phase='chronology'):
         state.records += 1
         raw = record.raw or {}
-        body = raw.get('payload', raw)
+        body = native_message_payload(raw)
         if not isinstance(body, dict):
             continue
         top, event = raw.get('type'), body.get('type', raw.get('type'))
+        if raw.get('inherited') or body.get('inherited') or body.get('is_replay'):
+            state.controls += 1
+            continue
         if top == 'session_meta':
-            state.session = str(body.get('id') or body.get('session_id') or '')
+            owner = str(body.get('id') or body.get('session_id') or '')
+            if state.session:
+                if owner != state.session:
+                    raise ValueError('conflicting native session ownership metadata')
+                continue
+            state.session = owner
             state.cwd = body.get('cwd')
             source = body.get('source')
             state.worker = body.get('thread_source') == 'subagent' or (
@@ -127,7 +143,11 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if top == 'turn_context':
             state.current_turn = body.get('turn_id')
             state.controls += 1
+            if state.anchor and (not record.timestamp or record.timestamp <= cutoff):
+                state.interval_raw_records += 1
             continue
+        if event == 'task_started' and body.get('turn_id'):
+            state.current_turn = body['turn_id']
         timestamp = record.timestamp.astimezone(timezone.utc) if record.timestamp else None
         if timestamp and state.last_time and timestamp < state.last_time:
             state.temporal_complete = False
@@ -138,6 +158,8 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         if timestamp and timestamp > cutoff:
             state.future += 1
             continue
+        if state.anchor:
+            state.interval_raw_records += 1
         classification = classify_conversation_record(record)
         if classification.label in {COMPACTED_HISTORY_SUMMARY, INJECTED_ENVIRONMENT_CONTEXT,
                                     TURN_CONTROL_OR_STATUS, SUBAGENT_NOTIFICATION}:
@@ -145,14 +167,14 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             continue
         if not record.text.strip():
             continue
-        if raw.get('inherited') or body.get('inherited') or body.get('is_replay'):
-            state.controls += 1
-            continue
         signature = (classification.label, hashlib.sha256(record.text.encode()).hexdigest())
         previous = state.last_transport
+        transport_id = body.get('message_id') or body.get('id')
+        proof = (body.get('turn_id') or state.current_turn, str(transport_id) if transport_id else None)
         mirror = (state.session and previous and record.line == previous[0] + 1
-                  and signature == previous[1] and {top, previous[2]} == {'response_item', 'event_msg'})
-        state.last_transport = (record.line, signature, top)
+                  and signature == previous[1] and {top, previous[2]} == {'response_item', 'event_msg'}
+                  and ((proof[0] and proof[0] == previous[3][0]) or (proof[1] and proof[1] == previous[3][1])))
+        state.last_transport = (record.line, signature, top, proof)
         if mirror:
             state.mirrors += 1
             continue
@@ -163,12 +185,13 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             if not timestamp:
                 state.temporal_complete = False
                 state.untimed += 1
-            if not state.anchor or (timestamp and (not state.anchor_time or timestamp >= state.anchor_time)):
-                state.anchor = excerpt(record, kind='human_message_start', mask_context=mask_context)
-                state.anchor_time = timestamp
-                state.entries.clear()
-                state.pending.clear()
-                state.retained_cost = state.after_anchor = state.retention_omitted = state.clipped = 0
+            # Native record order defines the latest eligible turn; reversed or
+            # untimed rows retain their explicit temporal uncertainty.
+            state.anchor = excerpt(record, kind='human_message_start', mask_context=mask_context)
+            state.anchor_time = timestamp
+            state.entries.clear()
+            state.pending.clear()
+            state.retained_cost = state.after_anchor = state.interval_raw_records = state.retention_omitted = state.clipped = 0
             continue
         if not state.anchor or is_current:
             continue
@@ -180,7 +203,8 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             arguments = body.get('input') or body.get('arguments')
             text = str(body.get('name') or '') + ' ' + (arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False))
             entry = excerpt(record, kind='tool_invocation', mask_context=mask_context, text=text)
-            call = str(body.get('call_id') or body.get('id') or '')
+            raw_call = str(body.get('call_id') or body.get('id') or '')
+            call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
             if call:
                 entry['call_id'] = clip(call, 256)
                 if len(state.pending) < 128:
@@ -191,7 +215,8 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
         elif event in {'function_call_output', 'custom_tool_call_output', 'tool_result', 'tool_output'}:
             entry = excerpt(record, kind='tool_result', mask_context=mask_context,
                 text=text_from_item(body.get('output') or body.get('content')) or record.text)
-            call = str(body.get('call_id') or body.get('id') or '')
+            raw_call = str(body.get('call_id') or body.get('id') or '')
+            call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
             invocation = state.pending.pop(call, None) if call else None
             entry['call_id'] = clip(call, 256) if call else None
             entry['invocation_ref'] = invocation['source_ref'] if invocation else None
@@ -204,20 +229,41 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
 def retain_interval(entries, anchor, *, cutoff, omissions):
     directory = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'jsonl-history-search' / 'interval-evidence'
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for candidate in [directory] + list(directory.parents)[:-1]:
+        info = candidate.lstat()
+        if stat.S_ISLNK(info.st_mode) or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+            raise OSError('unsafe linked or writable interval-artifact directory')
+    info = directory.lstat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise OSError('interval-artifact directory must be owner-only')
     fd, name = tempfile.mkstemp(prefix='native-', suffix='.jsonl', dir=directory)
+    digest, total, saved, omitted = hashlib.sha256(), 0, 0, 0
     with os.fdopen(fd, 'wb') as handle:
         header = {'kind': 'bounded_native_interval_excerpts', 'anchor': anchor,
+            'source_path': anchor['source_ref']['path'],
             'cutoff': cutoff.isoformat(), 'omissions': omissions,
             'claim_boundary': 'Exact bounded excerpts; claims/invocations/returned outcomes differ. Child sessions not established complete.'}
-        handle.write(encoded(header) + b'\n')
+        data = encoded(header) + b'\n'
+        if len(data) > RETAIN_LIMIT:
+            raise OSError('interval artifact header exceeds retained allowance')
+        handle.write(data)
+        digest.update(data)
+        total += len(data)
         for entry in entries:
-            handle.write(encoded(entry) + b'\n')
-    path = Path(name)
-    return {'path': name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
-            'bytes': path.stat().st_size, 'format': 'readable JSONL exact excerpts/native refs', 'requires_continuation': False}
+            data = encoded(entry) + b'\n'
+            if total + len(data) > RETAIN_LIMIT:
+                omitted += 1
+                continue
+            handle.write(data)
+            digest.update(data)
+            total += len(data)
+            saved += 1
+    return {'path': name, 'sha256': digest.hexdigest(), 'bytes': total,
+            'records': saved, 'omitted_records': omitted,
+            'format': 'readable JSONL exact excerpts/native refs; source_path header binds per-record lines', 'requires_continuation': False}
 
 
-def display_entries(entries, allowance, contexts):
+def display_entries(entries, allowance, contexts, path):
     if not entries or contexts <= 0 or allowance <= 0:
         return []
     count = min(contexts, len(entries))
@@ -226,26 +272,51 @@ def display_entries(entries, allowance, contexts):
     for group in groups:
         # Distribute native structural episodes over the full interval, with
         # claims and actual returned dispositions. No lexical/task ranking.
-        important = [e for e in group if e['kind'] == 'reported_claim' or e.get('outcome_spans')]
-        chosen = important or group
-        pieces, quota = [], max(0, per_group // len(chosen))
+        important = [e for e in group if e.get('outcome_spans')]
+        chosen = [e for e in group if e['kind'] == 'human_message_start']
+        for event in important:
+            position = group.index(event)
+            claims = [e for e in group[:position] if e['kind'] == 'reported_claim']
+            calls = [e for e in group[:position] if e['kind'] == 'tool_invocation' and e.get('call_id') == event.get('call_id')]
+            for e in (claims[-1:] + calls[-1:] + [event]):
+                if e not in chosen:
+                    chosen.append(e)
+        if not chosen:
+            chosen = group[:1] + group[-1:] if len(group) > 1 else group
+        # Account for each delivered separator, not only excerpt bodies.
+        pieces, quota = [], max(0, (per_group - len(chosen)) // len(chosen))
         for item in chosen:
             text = clip(item['text'], quota)
+            spans = [{'text_byte_start': 0, 'text_byte_end': len(text.encode()), 'text': text}]
             if item.get('outcome_spans'):
-                text = clip('\n'.join(s['text'] for s in item['outcome_spans']) + '\n' + text, quota)
+                # Keep original text offsets. Never move disposition lines under
+                # a different source, or present a synthetic contiguous passage.
+                spans = []
+                for span in item['outcome_spans']:
+                    value = clip(span['text'], max(0, (quota - len(item['outcome_spans']) + 1) // len(item['outcome_spans'])))
+                    spans.append({'text_byte_start': span['text_byte_start'], 'text_byte_end': span['text_byte_start'] + len(value.encode()), 'text': value})
+                text = '\n'.join(s['text'] for s in spans)
             if text:
                 pieces.append({'source_ref': item['source_ref'], 'timestamp': item['timestamp'],
-                    'kind': item['kind'], 'text': text, 'text_complete': item['text_complete'] and text == item['text'],
+                    'kind': item['kind'], 'text': text, 'spans': spans,
+                    'text_complete': item['text_complete'] and text == item['text'],
                     **({'invocation_ref': item['invocation_ref']} if 'invocation_ref' in item else {})})
         if pieces:
-            selected.append({'kind': 'chronological_context', 'source_ref': pieces[0]['source_ref'],
-                'timestamp': pieces[0]['timestamp'], 'text': '\n'.join(p['text'] for p in pieces),
-                'records': [{k: v for k, v in p.items() if k != 'text'} for p in pieces], 'native_record_count': len(group)})
+            text, references = '', []
+            for piece in pieces:
+                start = len(text.encode())
+                text += piece['text'] + '\n'
+                references.append({'line': piece['source_ref']['line'], 'kind': piece['kind'],
+                    'display_text_byte_start': start, 'display_text_byte_end': len(text.encode()) - 1,
+                    'native_spans': [{k: v for k, v in s.items() if k != 'text'} for s in piece['spans']],
+                    'text_complete': piece['text_complete'], 'invocation_ref': piece.get('invocation_ref')})
+            selected.append({'kind': 'chronological_context', 'source_ref': {'path': path, **pieces[0]['source_ref']},
+                'timestamp': pieces[0]['timestamp'], 'text': text, 'records': references, 'native_record_count': len(group)})
     return selected
 
 
 def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
-                                  cutoff, mask_context=None, output_format='json'):
+                                  cutoff, requested_cwd=None, mask_context=None, output_format='json'):
     cutoff = cutoff.astimezone(timezone.utc)
     files = list(enumerate_jsonl_files(plan, budget=budget, measured_byte_admission=True))
     states, errors, stats = [], [], RawLineScanStats()
@@ -263,6 +334,10 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             scan_session(state, kind=kind, default_tz=default_tz, budget=budget, stats=stats,
                 cutoff=cutoff, mask_context=mask_context, retained_limit=retained_limit,
                 request_session=request_session, request_turn=request_turn)
+            if state.records and not state.session:
+                state.anchor = None
+                state.entries.clear()
+                errors.append({'path': str(path), 'reason': 'native owning session/worker provenance unavailable; provider chronology unsupported'})
         except (OSError, ValueError, TypeError) as exc:
             errors.append({'path': str(path), 'reason': str(exc)})
         if not budget.available('chronology'):
@@ -280,6 +355,9 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     source_complete = not (caps or errors or unavailable or len(states) != len(files) or any(not s.complete for s in states))
     temporal = bool(chosen and chosen.temporal_complete)
     complete = source_complete and temporal and chosen is not None
+    if chosen and requested_cwd and chosen.cwd and Path(chosen.cwd).resolve() != Path(requested_cwd).resolve():
+        complete = False
+        errors.append({'reason': 'selected native session cwd differs from caller cwd; useful selected-source evidence is returned without parent verification'})
     entries = chosen.entries if chosen else [s.anchor for s in candidates][:max(0, min(30, plan.limits.max_matches))]
     omissions = {'native_control_records': sum(s.controls for s in states), 'native_event_mirrors': sum(s.mirrors for s in states),
         'after_cutoff_records': sum(s.future for s in states), 'retention_records': sum(s.retention_omitted for s in states),
@@ -290,37 +368,73 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             artifact = retain_interval(entries, chosen.anchor, cutoff=cutoff, omissions=omissions)
         except OSError as exc:
             errors.append({'reason': 'interval artifact unavailable: ' + str(exc)})
+    if artifact and artifact['omitted_records']:
+        omissions['artifact_records'] = artifact['omitted_records']
+    if parent and not parents:
+        errors.append({'reason': 'native requesting-side parent is outside or unavailable in admitted scope'})
+        complete = False
     limit = max(0, min(30, plan.limits.max_matches))
-    evidence = display_entries(entries, TEXT_LIMIT, limit) if chosen else entries
+    allowance = TEXT_LIMIT - len((chosen.anchor['text'] if chosen else '').encode())
+    def present(allowance):
+        if chosen:
+            return display_entries(entries, allowance, limit, str(chosen.path))
+        evidence = []
+        plausible = candidates[:limit]
+        for session in plausible:
+            evidence.extend(display_entries([session.anchor] + session.entries,
+                allowance // max(1, len(plausible)), limit // max(1, len(plausible)), str(session.path)))
+        return evidence
+    evidence = present(allowance)
     display_count = sum(len(e.get('records', [e])) for e in evidence)
     payload = {'query': query, 'status': 'chronological_evidence' if chosen else 'ambiguous' if candidates else 'unavailable' if not source_complete else 'not_found',
-        'evidence': evidence, 'scope': {'roots': [str(r.path) for r in plan.roots], 'cutoff': cutoff.isoformat()},
+        'evidence': evidence, 'scope': {'roots': [clip(str(r.path), 2048) for r in plan.roots[:20]],
+            'root_count': len(plan.roots), 'roots_display_complete': len(plan.roots) <= 20,
+            'cutoff': cutoff.isoformat()},
         'coverage': {'complete': complete, 'source_complete': source_complete, 'files_admitted': len(files),
             'files_read': len(budget.opened_sources), 'records_inspected': sum(s.records for s in states),
-            'source_errors': errors[:20], 'source_error_count': len(errors), 'cap_reasons': caps,
-            'unavailable_roots': unavailable[:20]},
+            'source_errors': [{k: clip(str(v), 1024) for k, v in e.items()} for e in errors[:20]],
+            'source_error_count': len(errors), 'cap_reasons': caps,
+            'unavailable_roots': [clip(p, 2048) for p in unavailable[:20]]},
         'chronology': {'scope': scope, 'anchor': chosen.anchor if chosen else None,
             'parent_relationship_verified': scope == 'proven_parent',
-            'candidate_anchors': [s.anchor for s in candidates][:limit] if not chosen else [],
+            'candidate_anchors': [],
             'temporal_complete': temporal, 'cutoff': cutoff.isoformat(),
             'untimed_records': sum(s.untimed for s in states), 'reversed_timestamps': sum(s.reversed for s in states),
             'post_anchor_records': chosen.after_anchor if chosen else None, 'interval_artifact': artifact,
+            'interval_raw_records': chosen.interval_raw_records if chosen else None,
             'retained': {'bytes': sum(s.retained_cost for s in states), 'limit_bytes': RETAIN_LIMIT,
                 'complete': not (omissions['retention_records'] or omissions['clipped_retained_records'])},
             'display': {'contexts': len(evidence), 'records': display_count, 'retained_records': len(entries),
                 'complete': display_count == len(entries) and all(e.get('text_complete', all(r.get('text_complete') for r in e.get('records', []))) for e in evidence)},
-            'unfinished_invocations': list(chosen.pending.values())[:limit] if chosen else []},
+            'unfinished_invocations': [{'source_line': e['source_ref']['line'], 'call_id': e['call_id']}
+                for e in list(chosen.pending.values())[:limit]] if chosen else []},
         'omissions': omissions, 'work': budget.to_dict(),
         'limits': {'max_files': plan.limits.effective_files(), 'max_bytes': budget.limit_bytes,
             'max_elapsed': budget.max_elapsed, 'max_matches': limit, 'evidence_text_bytes': TEXT_LIMIT,
             'response_bytes': RESPONSE_LIMIT, 'retained_payload_limit': RETAIN_LIMIT},
         'claim_boundary': 'Native selected-session chronology; selected session does not prove requesting-side parent lineage. Source/retained/displayed/final-answer completeness differ. Reported claims are not independent verification.'}
     from .output import render
-    while len((render(payload, output_format) + '\n').encode()) > RESPONSE_LIMIT and payload['evidence']:
-        payload['evidence'].pop()
-        payload['chronology']['display']['complete'] = False
-    if len((render(payload, output_format) + '\n').encode()) > RESPONSE_LIMIT:
-        payload['chronology']['unfinished_invocations'] = []
-        payload['chronology']['candidate_anchors'] = []
+    if len(query.encode()) > 4096 and len((render(payload, output_format) + '\n').encode()) > RESPONSE_LIMIT:
+        payload['query_display'] = {'complete': False, 'original_bytes': len(query.encode()), 'sha256': hashlib.sha256(query.encode()).hexdigest()}
         payload['query'] = clip(query, 4096)
+    while len((render(payload, output_format) + '\n').encode()) > RESPONSE_LIMIT and payload['evidence']:
+        allowance //= 2
+        payload['evidence'] = present(allowance)
+        payload['chronology']['display']['complete'] = False
+    while len((render(payload, output_format) + '\n').encode()) > RESPONSE_LIMIT:
+        # All source/anchor facts retain counts and native omissions. Reduce
+        # metadata presentation, not source authority or operation allowances.
+        if payload['evidence']:
+            payload['evidence'] = []
+            payload['chronology']['display']['complete'] = False
+        elif payload['coverage']['source_errors']:
+            payload['coverage']['source_errors'] = []
+            payload['coverage']['errors_display_complete'] = False
+        elif payload['scope']['roots']:
+            payload['scope']['roots'] = []
+            payload['scope']['roots_display_complete'] = False
+        else:
+            raise ValueError('fixed chronological response metadata exceeds response allowance')
+    payload['chronology']['display']['contexts'] = len(payload['evidence'])
+    payload['chronology']['display']['records'] = sum(len(e.get('records', [e])) for e in payload['evidence'])
     return payload

@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .records import Record, text_from_item
+from .records import Record, text_from_item, native_message_payload
 
 
 CONVERSATION_RECORD_LABELS: tuple[str, ...] = (
@@ -52,9 +52,10 @@ ASSISTANT_TYPES = {
     "assistant",
     "assistant_message",
     "agent_message",
+    "agentmessage",
     "assistant_response",
 }
-USER_MESSAGE_PAYLOAD_TYPES = {"message", "user_message"}
+USER_MESSAGE_PAYLOAD_TYPES = {"message", "user_message", "usermessage"}
 TEXT_CONTENT_TYPES = {"input_text", "text", "message_text"}
 
 INJECTED_INITIAL_TAGS = {
@@ -123,7 +124,7 @@ def classify_conversation_record(record: Mapping[str, Any] | Record | Any) -> Co
     if raw is None:
         return _classification(UNKNOWN, "low", ["record is not a JSON object"])
 
-    payload = raw.get("payload")
+    payload = native_message_payload(raw)
     payload_map = payload if isinstance(payload, Mapping) else {}
     message = raw.get("message")
     message_map = message if isinstance(message, Mapping) else {}
@@ -221,7 +222,7 @@ def _classification(
 
 
 def _record_text(raw: Mapping[str, Any]) -> str:
-    payload = raw.get("payload")
+    payload = native_message_payload(raw)
     if isinstance(payload, Mapping):
         if "content" in payload:
             text = _content_text(payload.get("content"))
@@ -281,7 +282,7 @@ def _is_supported_human_user_payload(
             content = payload.get("content")
             if payload_role != "user" or not _content_list_is_plain_text(content):
                 return False
-        if payload_type == "user_message" and "message" not in payload:
+        if payload_type in {"user_message", "usermessage"} and "message" not in payload:
             return False
         return True
 

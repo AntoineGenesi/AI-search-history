@@ -78,7 +78,6 @@ from .impact_benchmark import DEFAULT_FIXTURE as DEFAULT_IMPACT_FIXTURE
 from .impact_benchmark import build_impact_benchmark_payload
 from .install_validation import validate_install
 from .inspect_adapter import DEFAULT_X12G_ADJUDICATION_PATH, write_inspect_compatible_export
-from .latest_user_messages import build_latest_user_messages_payload
 from .lineage import build_lineage_payload
 from .live_terminal_protocol import build_live_terminal_protocol_payload
 from .manifest import build_manifest_report
@@ -3018,15 +3017,12 @@ def _named_task_source_session_action_argv(argv: list[str]) -> bool:
         return (
             module == "jsonl_history_search.cli"
             and module_index + 1 < len(argv)
-            and argv[module_index + 1] in {"ask", "what-happened-since"}
+            and argv[module_index + 1] == "ask"
         )
     if executable == "git":
         subcommand = _named_task_source_session_git_subcommand(argv)
         return subcommand in {"commit", "apply"} or (subcommand == "diff" and "--check" in argv)
-    return executable == "jsonl-history-search" and len(argv) > 1 and argv[1] in {
-        "ask",
-        "what-happened-since",
-    }
+    return executable == "jsonl-history-search" and len(argv) > 1 and argv[1] == "ask"
 
 
 def _named_task_source_session_setup_argv(argv: list[str]) -> bool:
@@ -3222,7 +3218,7 @@ def main(argv: list[str] | None = None) -> int:
         from .history_answer import is_direct_latest_message_history_query, retrieve_chronological_evidence
         default_tz = timezone_from_args(args.timezone, args.timezone_offset)
         operation = retrieve_chronological_evidence if is_direct_latest_message_history_query(args.query) else retrieve_history_evidence
-        extra = {'cutoff': parse_now(args.now, default_tz)} if operation is retrieve_chronological_evidence else {}
+        extra = {'cutoff': parse_now(args.now, default_tz), 'requested_cwd': args.cwd} if operation is retrieve_chronological_evidence else {}
         payload = operation(query=args.query, intent=intent, plan=plan,
             default_tz=default_tz, budget=budget,
             mask_context=_mask_context_from_args(args), output_format=args.format, **extra)

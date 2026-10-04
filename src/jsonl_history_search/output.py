@@ -581,7 +581,17 @@ def render_history_evidence(payload: dict) -> str:
             lines.append('Human boundary: %s | %s | %s' % (ref_target(anchor['source_ref']), anchor['timestamp'], anchor['text']))
         lines.append('Time uncertainty: ' + str(not chronology['temporal_complete']))
         for item in payload['evidence']:
-            lines.extend(['', '%s | %s' % (ref_target(item['source_ref']), item['timestamp']), item['text']])
+            if item.get('records'):
+                original = item['text'].encode()
+                for record in item['records']:
+                    target = '%s:%s' % (item['source_ref']['path'], record['line'])
+                    value = original[record['display_text_byte_start']:record['display_text_byte_end']].decode()
+                    lines.extend(['', target + ' | ' + record['kind'], value,
+                        'Native spans: ' + json.dumps(record['native_spans'])])
+                    if record.get('invocation_ref'):
+                        lines.append('Paired invocation: %s:%s' % (item['source_ref']['path'], record['invocation_ref']['line']))
+            else:
+                lines.extend(['', '%s | %s' % (ref_target(item['source_ref']), item['timestamp']), item['text']])
         lines.append('Retained evidence: ' + json.dumps(chronology['interval_artifact']))
         lines.append('Display coverage: ' + json.dumps(chronology['display']))
         lines.extend(['', 'Omissions: ' + json.dumps(payload['omissions']), payload['claim_boundary']])
