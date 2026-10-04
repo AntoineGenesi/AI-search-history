@@ -25,10 +25,20 @@ from .sources import cap_labels_from_warnings, enumerate_jsonl_files, source_kin
 
 
 def is_direct_latest_message_history_query(query):
-    text = ' '.join(query.lower().split())
-    if re.match(r'^(?:explain|implement|fix|debug|write|why\b)', text):
-        return False
-    return bool(re.search(r'\bwhat(?:\s+the\s+\w+)?\s+(?:(?:has|have)\s+)?(?:happened|did\s+you\s+do).*\b(?:since\s+(?:my|the)\s+last\s+(?:message|turn)|while\s+i\s+was\s+away)', text))
+    # Classification only: the original query still corroborates native identity.
+    text = ' '.join(query.lower().replace('’', "'").split())
+    text = re.sub(r"\b(you|we|what)'ve\b", r'\1 have', text)
+    text = re.sub(r"\bwhat's\b", 'what has', text)
+    text = re.sub(r'^(?:(?:can|could|would) you\s+)?(?:please\s+)?', '', text)
+    recap = re.match(
+        r'^(?:what(?: the \w+)? (?:(?:has|have) )?(?:happened|changed)\b|'
+        r'what (?:have you done|have we done|did you do)\b|catch me up\b|'
+        r'summari[sz]e\b|give me (?:a |an )?(?:recap|update|progress update)\b|update me\b)', text)
+    boundary = re.search(
+        r'\b(?:(?:since|after) (?:(?:my|the) (?:last|previous) (?:message|turn)\b|'
+        r'i last (?:messaged|asked|wrote|spoke)\b|'
+        r'(?:the )?last time i (?:messaged|asked|wrote|spoke)\b)|while i was away\b)', text)
+    return bool(recap and boundary)
 
 
 def clip(text, allowance):

@@ -29,7 +29,9 @@ uses the existing4MiB retained-payload bound, including framing; this is not a
 total-RAM bound or automatic model-read allowance. Read only within the authorized
 delivery/context allowance. Check its END OF BOUNDED CHRONOLOGY REPORT marker; if a read truncates,
 use bounded contiguous file ranges within the authorized delivery allowance or
-name the gap. Source, temporal, retained and projection completeness differ.
+name the gap. Nested commands and enclosing tool wrappers each have independent
+output limits; allow sufficient output at both levels or use bounded contiguous
+reads. Source, temporal, retained and projection completeness differ.
 Reports are unverified assistant claims; returned outputs and paired invocation
 refs support only what they actually show. Preserve failures and unfinished work.
 
