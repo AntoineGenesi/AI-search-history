@@ -672,7 +672,8 @@ def build_source_plan(
                         provider="unknown",
                         app="unknown",
                         platform=platform_for_path(root),
-                        root_format="json" if root.suffix == ".json" else "markdown" if root.suffix == ".md" else "jsonl",
+                        root_format="json" if root.suffix == ".json" else "markdown" if root.suffix == ".md"
+                            else "jsonl" if root.suffix == ".jsonl" else "json_or_jsonl",
                     )
                 )
 
@@ -1989,6 +1990,8 @@ def filename_preference_score(path: Path, preferred_terms: list[str]) -> int:
 
 
 def directory_file_suffixes(source_kind: str) -> tuple[str, ...]:
+    if source_kind == "arbitrary_jsonl_root":
+        return (".jsonl", ".json")
     if source_kind == "claude_desktop_json_directory":
         return (".json",)
     if source_kind in {"gemini_sessions", "gemini_session_file"}:

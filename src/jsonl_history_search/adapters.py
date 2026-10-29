@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 
 from .records import Record, parse_record, text_from_item
+from .imported_history import imported_message, retained_excerpt
 from .timeutil import parse_datetime
 from .operation_budget import BudgetExceeded, open_source_text, read_source_text
 
@@ -107,6 +108,38 @@ class JsonlAdapter:
                     continue
                 if raw_line_stats is not None:
                     raw_line_stats.full_json_records_parsed += 1
+                if source_kind == "arbitrary_jsonl_root":
+                    try:
+                        data = json.loads(line)
+                    except (json.JSONDecodeError, RecursionError):
+                        _note_malformed(raw_line_stats, "imported", path, line_number, "malformed imported JSONL row")
+                        continue
+                    if not isinstance(data, dict):
+                        _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported imported JSONL row")
+                        continue
+                    if isinstance(data.get('record_type'), str) and isinstance(data.get('payload'), dict):
+                        record = imported_message(data, path=path, line=line_number, default_tz=default_tz,
+                            message=data['payload'], locator='#/payload', projected=True)
+                        if record is not None:
+                            yield record
+                        elif (data.get('record_type') in ('session_meta', 'turn_context') or
+                                data['payload'].get('type') in ('session_meta', 'turn_context', 'status')):
+                            _note_ignored(raw_line_stats)
+                        else:
+                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported projected message")
+                        continue
+                    # Keep recognized native transports on their existing parser.
+                    # Metadata objects are never compact-JSON conversation text.
+                    if not (data.get('type') in ('response_item', 'event_msg', 'session_meta',
+                            'turn_context', 'compacted', 'custom', 'summary') or
+                            isinstance(data.get('message'), dict)):
+                        record = imported_message(data, path=path, line=line_number, default_tz=default_tz,
+                            message=data, locator='#', projected=False)
+                        if record is not None:
+                            yield record
+                        else:
+                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported imported JSONL object")
+                        continue
                 record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
                 if record.raw is None and raw_line_stats is not None:
                     _note_malformed(raw_line_stats, "jsonl", path, line_number, "malformed JSONL row")
@@ -139,18 +172,44 @@ class GenericMessageArrayJsonAdapter:
                 data = json.load(handle)
         except OSError as exc:
             raise AdapterReadError(f"Could not open {path}: {exc}") from exc
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError) as exc:
+            _note_malformed(raw_line_stats, "json", path, getattr(exc, 'lineno', None), "malformed or excessively nested imported JSON")
             return
         if not isinstance(data, dict):
+            _note_skipped(raw_line_stats, "json", path, None, "unsupported JSON: expected a conversation object")
+            return
+        imported = source_kind in {"arbitrary_json_file", "arbitrary_jsonl_root"}
+        if imported and isinstance(data.get('history_excerpt'), str):
+            if raw_line_stats is not None:
+                raw_line_stats.full_json_records_parsed += 1
+            yield retained_excerpt(data, path=path)
             return
         messages = data.get("messages")
         if not isinstance(messages, list):
+            _note_skipped(raw_line_stats, "json", path, None, "unsupported JSON: no messages array or retained history field")
             return
         conversation_id = _string_or_none(data.get("conversation_id"))
         top_level_unsupported = sorted(set(data) - {"conversation_id", "messages"})
         for index, message in enumerate(messages, 1):
+            if budget is not None:
+                budget.check(budget_phase)
             if raw_line_stats is not None:
                 raw_line_stats.full_json_records_parsed += 1
+            if imported:
+                if not isinstance(message, dict):
+                    _note_skipped(raw_line_stats, "imported", path, None, "unsupported non-object message")
+                    continue
+                record = imported_message(data, path=path, line=1, default_tz=default_tz,
+                    message=message, locator=f'#/messages/{index - 1}', projected=False)
+                if record is None:
+                    _note_skipped(raw_line_stats, "imported", path, None, "unsupported imported message")
+                    continue
+                # JSON pointer owns structured-message identity; line 1 is the
+                # physical document anchor, never a made-up message line.
+                record.source_ref = f'{path}#/messages/{index - 1}'
+                record.import_provenance['physical_location'] = 'document_start'
+                yield record
+                continue
             if not isinstance(message, dict):
                 yield Record(
                     path=str(path),
