@@ -69,7 +69,8 @@ def documentary_report(data: dict, *, path: Path, line: int) -> Record | None:
 
 
 def imported_message(data: dict, *, path: Path, line: int, default_tz,
-                     message: dict, locator: str, projected: bool) -> Record | None:
+                     message: dict, locator: str, projected: bool,
+                     allow_unattributed: bool = False) -> Record | None:
     declared_role = message.get('role')
     message_type = message.get('type')
     if declared_role is not None and not isinstance(declared_role, str):
@@ -108,7 +109,8 @@ def imported_message(data: dict, *, path: Path, line: int, default_tz,
         text = message_type + ('\n' + '\n'.join(parts) if parts else '')
     elif message.get('projection_notice') and isinstance(message.get('text'), str):
         role, text, text_field = 'unattributed', message['text'], 'text'
-    elif role in {'user', 'assistant', 'tool', 'system', 'developer'} and (
+    elif (role in {'user', 'assistant', 'tool', 'system', 'developer'}
+          or (allow_unattributed and role == 'unattributed')) and (
             message_type is None or message_type in _MESSAGE_TYPES):
         for key in ('text', 'content', 'message'):
             value = text_from_item(message.get(key))
@@ -152,37 +154,119 @@ def imported_message(data: dict, *, path: Path, line: int, default_tz,
         provider='imported', import_provenance=provenance)
 
 
-def retained_record(data: dict, *, path: Path, line: int, default_tz) -> Record | None:
-    """Read one explicit export wrapper without trusting its claimed origin."""
+def retained_metadata(data: dict) -> bool:
+    """Recognized retained transport metadata is not a conversation passage."""
     inner = data.get('record')
-    if not isinstance(data.get('source_ref'), str) or not isinstance(inner, dict):
-        return None
-    if not isinstance(inner.get('type'), str):
+    return (isinstance(data.get('source_ref', data.get('ref')), str) and isinstance(inner, dict)
+            and inner.get('type') in {'session_meta', 'turn_context', 'progress', 'status'})
+
+
+def _retained_content(value) -> tuple[str, bool]:
+    """Decode explicit message/tool blocks, never arbitrary wrapper metadata."""
+    if isinstance(value, str):
+        return value, False
+    if not isinstance(value, list):
+        return '', False
+    parts, tools = [], False
+    for block in value:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get('type')
+        if kind in {'text', 'input_text', 'output_text'} and isinstance(block.get('text'), str):
+            parts.append(block['text'])
+        elif kind == 'tool_use' and isinstance(block.get('name'), str) and 'input' in block:
+            parts.append(block['name'] + ' ' + json.dumps(block['input'], ensure_ascii=False))
+            tools = True
+        elif kind == 'tool_result':
+            text = text_from_item(block.get('content'))
+            if text:
+                parts.append(text)
+            tools = True
+    return '\n'.join(parts), tools
+
+
+def retained_record(data: dict, *, path: Path, line: int, default_tz) -> Record | None:
+    """Read declared retained transports without trusting their claimed origin."""
+    inner = data.get('record')
+    origin_key = 'source_ref' if 'source_ref' in data else 'ref'
+    if not isinstance(data.get(origin_key), str) or not isinstance(inner, dict):
         return None
     message, locator = inner, '#/record'
-    if inner.get('type') in {'response_item', 'event_msg'}:
+    content_tools = False
+    prompt_history = (set(inner) <= {'session_id', 'ts', 'text'} and isinstance(inner.get('text'), str)
+                      and 'ts' in inner)
+    if prompt_history:
+        # A prompt-history transport declares text and a clock, not its author.
+        message = {'role': 'unattributed', 'text': inner['text'], 'timestamp': inner['ts']}
+    elif inner.get('type') in {'response_item', 'event_msg'}:
         message, locator = inner.get('payload'), '#/record/payload'
-    if not isinstance(message, dict) or not isinstance(message.get('type'), str):
+        if isinstance(message, dict) and message.get('type') == 'item_completed':
+            message, locator = message.get('item'), locator + '/item'
+            if isinstance(message, dict) and message.get('type') in {'UserMessage', 'AgentMessage'}:
+                message = {**message, 'type': 'message',
+                           'role': 'user' if message['type'] == 'UserMessage' else 'assistant',
+                           'content': message.get('content') or message.get('text')}
+    elif inner.get('type') in {'user', 'assistant'} and isinstance(inner.get('message'), dict):
+        message, locator = inner['message'], '#/record/message'
+        if message.get('role') != inner['type']:
+            return None
+        text, content_tools = _retained_content(message.get('content'))
+        if not text:
+            return None
+        message = {**message, 'type': 'message', 'text': text}
+    if not isinstance(message, dict):
         return None
-    if message['type'] not in (_MESSAGE_TYPES | _FUNCTION_CALL_TYPES | _FUNCTION_OUTPUT_TYPES | _ACTION_TYPES):
+    if not prompt_history and message.get('type') not in (
+            _MESSAGE_TYPES | _FUNCTION_CALL_TYPES | _FUNCTION_OUTPUT_TYPES | _ACTION_TYPES):
         return None
-    # The embedded clock is a declaration. The outer wrapper never supplies
-    # time, identity or an instruction to open the claimed original source.
+    # The embedded clock is a declaration. The outer claimed source supplies no
+    # time, native identity, lineage or instruction to open another path.
     if 'created_at' not in message and 'timestamp' not in message:
         message = {**message, 'timestamp': inner.get('timestamp', inner.get('created_at'))}
     record = imported_message(data, path=path, line=line, default_tz=default_tz,
-        message=message, locator=locator, projected=False)
+        message=message, locator=locator, projected=False, allow_unattributed=prompt_history)
     if record is None:
         return None
     record.source_format = 'retained_record_jsonl'
     provenance = record.import_provenance
-    provenance['attribution'] = 'declared_retained_record'
-    provenance['claimed_origin'] = {'value': data['source_ref'], 'status': 'unverified_claim_only'}
+    provenance['attribution'] = 'unattributed_prompt_history' if prompt_history else 'declared_retained_record'
+    provenance['claimed_origin'] = {'value': data[origin_key], 'status': 'unverified_claim_only'}
+    if prompt_history:
+        provenance['declared_role'] = None
+        provenance['declared_type'] = None
+        provenance['value_locator'] = '#/record/text'
+        provenance['clock_basis'] = 'declared_prompt_history_ts'
+        provenance['request_boundary'] = None
+    elif locator == '#/record/message':
+        provenance['value_locator'] = locator + '/content'
+        if content_tools:
+            provenance['request_boundary'] = None
+            provenance['coverage_notes'].append(
+                'Declared message includes tool blocks; tool arguments/results do not prove execution or call-pair identity.')
+        if record.role == 'user' and isinstance(inner['message'].get('content'), list) and all(
+                isinstance(block, dict) and block.get('type') == 'tool_result' for block in inner['message']['content']):
+            record.role = 'tool'
     if record.role == 'user':
         classification = classify_conversation_record({'role': record.role, 'text': record.text})
         if classification.label != UNKNOWN:
             provenance['request_boundary'] = None
     return record
+
+
+def retained_text(data: dict, *, path: Path, line: int) -> Record | None:
+    """A standalone retained excerpt has no declared speaker, clock or lineage."""
+    value = data.get('retained_pre_followup_exchange')
+    if not isinstance(value, str) or not value:
+        return None
+    return Record(path=str(path), line=line, role='unattributed', text=value,
+        timestamp=None, timestamp_quality='unknown', raw=data, provider='imported',
+        source_format='retained_text_jsonl', import_provenance={
+            'attribution': 'unattributed_retained_text', 'declared_role': None,
+            'value_locator': '#/retained_pre_followup_exchange',
+            'text_coordinate_basis': 'utf8_bytes_of_decoded_retained_text',
+            'request_boundary': None, 'native_authorship_verified': False,
+            'coverage_notes': ['Retained text does not establish authors, native clocks, parents or executed tool calls.'],
+        })
 
 
 def retained_excerpt(data: dict, *, path: Path) -> Record:

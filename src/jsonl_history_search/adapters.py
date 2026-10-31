@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterable, Protocol
 
 from .records import Record, parse_record, text_from_item
 from .imported_history import (documentary_report, imported_message, is_documentary_report,
-    retained_excerpt, retained_record)
+    retained_excerpt, retained_metadata, retained_record, retained_text)
 from .timeutil import parse_datetime
 from .operation_budget import BudgetExceeded, open_source_text, read_source_text
 
@@ -125,12 +125,21 @@ class JsonlAdapter:
                         else:
                             _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported documentary JSONL object")
                         continue
-                    if 'source_ref' in data and 'record' in data:
+                    if 'record' in data and ('source_ref' in data or 'ref' in data):
                         record = retained_record(data, path=path, line=line_number, default_tz=default_tz)
                         if record is not None:
                             yield record
+                        elif retained_metadata(data):
+                            _note_ignored(raw_line_stats)
                         else:
                             _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported retained-record export")
+                        continue
+                    if 'retained_pre_followup_exchange' in data:
+                        record = retained_text(data, path=path, line=line_number)
+                        if record is not None:
+                            yield record
+                        else:
+                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported retained text")
                         continue
                     if isinstance(data.get('record_type'), str) and isinstance(data.get('payload'), dict):
                         record = imported_message(data, path=path, line=line_number, default_tz=default_tz,
