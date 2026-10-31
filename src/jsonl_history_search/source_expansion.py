@@ -969,33 +969,27 @@ def build_source_expansion_payload(
         }
 
     total_records = len(records)
-    anchor_position = parsed.line
+    # Physical lines and normalized record positions diverge when adapters ignore
+    # metadata. Resolve identity first; only selection uses compact record order.
     if parsed.native_ref:
         positions = [index + 1 for index, record in enumerate(records)
                      if parsed.native_ref == record.source_ref or parsed.native_ref in (record.source_refs or [])]
-        if len(positions) != 1:
-            return {"source_expansion": {**base_payload,
-                    "status": "ambiguous_native_ref" if positions else "native_ref_not_found",
-                    "records": [], "source_path": str(source_path),
-                    "matching_record_count": len(positions), "scope": source_scope(plan)}}
-        anchor_position = positions[0]
+    else:
+        positions = [index + 1 for index, record in enumerate(records) if record.line == parsed.line]
+    if len(positions) != 1:
+        status = ('ambiguous_native_ref' if positions else 'native_ref_not_found') if parsed.native_ref else (
+            'ambiguous_anchor_line' if positions else 'anchor_line_not_found')
+        return {"source_expansion": {**base_payload, "status": status, "records": [],
+                "source_path": str(source_path), "source_kind": source_kind,
+                "total_records_in_source": total_records, "matching_record_count": len(positions),
+                "scope": source_scope(plan)}}
+    anchor_position = positions[0]
+    if parsed.native_ref:
         base_payload["anchor"]["source_ref"] = evidence_ref(records[anchor_position - 1])
-    if anchor_position is None or anchor_position > total_records:
-        return {
-            "source_expansion": {
-                **base_payload,
-                "status": "anchor_line_not_found",
-                "records": [],
-                "source_path": str(source_path),
-                "source_kind": source_kind,
-                "total_records_in_source": total_records,
-                "scope": source_scope(plan),
-            }
-        }
 
     selection = select_records(
         records,
-        anchor_line=anchor_position,
+        anchor_position=anchor_position,
         mode=request.mode,
         scope=request.scope,
         before=max(0, int(request.before)),
@@ -1007,14 +1001,19 @@ def build_source_expansion_payload(
     requested_count = int(selection["requested_count"])
     range_start = selection["range_start"]
     range_end = selection["range_end"]
+    selected_identities = {evidence_identity(record) for record in selected}
+    selected_positions = [index + 1 for index, record in enumerate(records)
+                          if evidence_identity(record) in selected_identities]
+    start_position = min(selected_positions) if selected_positions else anchor_position
+    end_position = max(selected_positions) if selected_positions else anchor_position
     included_count = len(selected)
     omitted_count = max(0, requested_count - included_count)
     start_of_source_reached = bool(
-        range_start == 1
+        bool(selected) and start_position == 1
         or (
             request.mode == "before"
             and requested_count == 0
-            and parsed.line == 1
+            and anchor_position == 1
             and selection["candidate_start"] is None
             and selection["candidate_end"] is None
         )
@@ -1056,7 +1055,7 @@ def build_source_expansion_payload(
         "truncated": omitted_count > 0,
         "boundary_flags": {
             "start_of_source_reached": start_of_source_reached,
-            "end_of_source_reached": bool(range_end == total_records or (request.mode == "next" and included_count < request.next_count)),
+            "end_of_source_reached": bool((selected and end_position == total_records) or (request.mode == "next" and included_count < request.next_count)),
             "start_of_candidate_range_reached": bool(range_start == selection["candidate_start"]),
             "end_of_candidate_range_reached": bool(range_end == selection["candidate_end"]),
         },
@@ -1070,20 +1069,7 @@ def build_source_expansion_payload(
             source_path=source_path,
             selected_records=selected,
             observed_range_end=range_end,
-            total_records=total_records,
-        ),
-        "continuation": build_expansion_continuation(
-            source_path=str(source_path),
-            anchor_line=parsed.line,
-            range_start=range_start,
-            range_end=range_end,
-            total_records=total_records,
-            mode=request.mode,
-            scope=request.scope,
-            before=max(0, int(request.before)),
-            after=max(0, int(request.after)),
-            next_count=max(0, int(request.next_count)),
-            max_records=max(0, int(request.max_records)),
+            total_records=records[-1].line,
         ),
         "projection_summary": source_expansion_projection_summary(
             selected,
@@ -1100,24 +1086,19 @@ def build_source_expansion_payload(
         ],
         "scope": source_scope(plan),
     }
-    if parsed.native_ref:
-        positions = [index + 1 for index, record in enumerate(records)
-                     if evidence_identity(record) in {evidence_identity(item) for item in selected}]
-        start_position = min(positions) if positions else anchor_position
-        end_position = max(positions) if positions else anchor_position
-        payload["source_positions"] = {"anchor": anchor_position, "start": start_position, "end": end_position,
-                                        "meaning": "normalized source record order; not physical lines"}
-        payload["continuation"] = {
-            "semantics": "Continue from native boundary refs in normalized source record order.",
-            "more_before_available": start_position > 1, "more_after_available": end_position < total_records,
-            "scope": request.scope, "anchor": {"target": parsed.native_ref},
-            "next_steps": ([{"direction": "before", "target": ref_target(evidence_ref(selected[0])),
-                             "mode": "before", "before": request.before or request.max_records,
-                             "max_records": request.max_records, "scope": request.scope}] if selected and start_position > 1 else []) +
-                          ([{"direction": "after", "target": ref_target(evidence_ref(selected[-1])),
-                             "mode": "next", "next_count": request.next_count or request.max_records,
-                             "max_records": request.max_records, "scope": request.scope}] if selected and end_position < total_records else []),
-        }
+    payload["source_positions"] = {"anchor": anchor_position, "start": start_position, "end": end_position,
+                                    "meaning": "normalized source record order; not physical lines"}
+    payload["continuation"] = {
+        "semantics": "Continue from returned boundary refs in normalized source record order.",
+        "more_before_available": start_position > 1, "more_after_available": end_position < total_records,
+        "scope": request.scope, "anchor": {"target": parsed.native_ref or parsed.raw_target},
+        "next_steps": ([{"direction": "before", "target": ref_target(evidence_ref(selected[0])),
+                         "mode": "before", "before": request.before or request.max_records,
+                         "max_records": request.max_records, "scope": request.scope}] if selected and start_position > 1 else []) +
+                      ([{"direction": "after", "target": ref_target(evidence_ref(selected[-1])),
+                         "mode": "next", "next_count": request.next_count or request.max_records,
+                         "max_records": request.max_records, "scope": request.scope}] if selected and end_position < total_records else []),
+    }
     live_tail_caveat = payload["live_tail_caveat"]
     if live_tail_caveat.get("applies"):
         payload["claim_boundaries"] = {
@@ -1224,9 +1205,9 @@ def build_source_expansion_live_tail_caveat(
 ) -> dict[str, Any]:
     now = _source_expansion_aware_utc(now_utc or datetime.now(timezone.utc))
     last_record = records[-1] if records else None
-    total_records = len(records)
+    tail_line = last_record.line if last_record is not None else 0
     lines_from_tail = (
-        max(0, total_records - observed_range_end) if observed_range_end is not None else None
+        max(0, tail_line - observed_range_end) if observed_range_end is not None else None
     )
     near_tail = lines_from_tail is not None and lines_from_tail <= LIVE_TAIL_MAX_LINE_DISTANCE
     try:
@@ -3131,7 +3112,7 @@ def source_path_allowed(path: Path, plan: SourcePlan) -> bool:
 def select_records(
     records: list[Any],
     *,
-    anchor_line: int,
+    anchor_position: int,
     mode: str,
     scope: str,
     before: int,
@@ -3141,20 +3122,20 @@ def select_records(
 ) -> dict[str, Any]:
     total_records = len(records)
     if mode == "record":
-        start = anchor_line
-        end = anchor_line
+        start = anchor_position
+        end = anchor_position
     elif mode in {"window", "neighborhood"}:
-        start = max(1, anchor_line - before)
-        end = min(total_records, anchor_line + after)
+        start = max(1, anchor_position - before)
+        end = min(total_records, anchor_position + after)
     elif mode == "before":
-        start = max(1, anchor_line - before)
-        end = max(0, anchor_line - 1)
+        start = max(1, anchor_position - before)
+        end = max(0, anchor_position - 1)
     else:
-        start = min(total_records + 1, anchor_line + 1)
-        end = min(total_records, anchor_line + next_count)
+        start = min(total_records + 1, anchor_position + 1)
+        end = min(total_records, anchor_position + next_count)
     requested_count = max(0, end - start + 1)
     candidate_records = records[start - 1 : end] if requested_count else []
-    scoped_records = filter_records_by_scope(candidate_records, records[anchor_line - 1], scope=scope)
+    scoped_records = filter_records_by_scope(candidate_records, records[anchor_position - 1], scope=scope)
     scope_filtered_count = max(0, requested_count - len(scoped_records))
     if max_records > 0:
         selected = scoped_records[-max_records:] if mode == "before" else scoped_records[:max_records]
@@ -3166,8 +3147,8 @@ def select_records(
             "requested_count": requested_count,
             "range_start": None,
             "range_end": None,
-            "candidate_start": start if requested_count else None,
-            "candidate_end": end if requested_count else None,
+            "candidate_start": int(records[start - 1].line) if requested_count else None,
+            "candidate_end": int(records[end - 1].line) if requested_count else None,
             "scope_filtered_count": scope_filtered_count,
         }
     return {
@@ -3175,8 +3156,8 @@ def select_records(
         "requested_count": requested_count,
         "range_start": int(selected[0].line),
         "range_end": int(selected[-1].line),
-        "candidate_start": start,
-        "candidate_end": end,
+        "candidate_start": int(records[start - 1].line),
+        "candidate_end": int(records[end - 1].line),
         "scope_filtered_count": scope_filtered_count,
     }
 
@@ -3228,56 +3209,6 @@ def record_session(record: Any) -> str | None:
                 return str(value)
     return getattr(record, "conversation_id", None)
 
-
-def build_expansion_continuation(
-    *,
-    source_path: str,
-    anchor_line: int,
-    range_start: int | None,
-    range_end: int | None,
-    total_records: int,
-    mode: str,
-    scope: str,
-    before: int,
-    after: int,
-    next_count: int,
-    max_records: int,
-) -> dict[str, Any]:
-    more_before = bool(range_start and range_start > 1)
-    more_after = bool(range_end and range_end < total_records)
-    return {
-        "semantics": "Continue with bounded read-more calls from returned boundary targets; no broad search or ranking is rerun.",
-        "more_before_available": more_before,
-        "more_after_available": more_after,
-        "scope": scope,
-        "next_steps": [
-            step
-            for step in (
-                {
-                    "direction": "before",
-                    "target": f"{source_path}:{range_start}",
-                    "mode": "before",
-                    "before": before or max_records,
-                    "max_records": max_records,
-                    "scope": scope,
-                }
-                if more_before and range_start
-                else None,
-                {
-                    "direction": "after",
-                    "target": f"{source_path}:{range_end}",
-                    "mode": "next",
-                    "next_count": next_count or max_records,
-                    "max_records": max_records,
-                    "scope": scope,
-                }
-                if more_after and range_end
-                else None,
-            )
-            if step is not None
-        ],
-        "anchor": {"target": f"{source_path}:{anchor_line}", "line": anchor_line},
-    }
 
 
 COMPACT_SUPPRESSED_ROLES = {"token_count"}
