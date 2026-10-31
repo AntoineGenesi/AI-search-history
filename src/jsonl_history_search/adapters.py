@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 
 from .records import Record, parse_record, text_from_item
-from .imported_history import imported_message, retained_excerpt
+from .imported_history import imported_message, retained_excerpt, retained_record
 from .timeutil import parse_datetime
 from .operation_budget import BudgetExceeded, open_source_text, read_source_text
 
@@ -116,6 +116,13 @@ class JsonlAdapter:
                         continue
                     if not isinstance(data, dict):
                         _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported imported JSONL row")
+                        continue
+                    if 'source_ref' in data and 'record' in data:
+                        record = retained_record(data, path=path, line=line_number, default_tz=default_tz)
+                        if record is not None:
+                            yield record
+                        else:
+                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported retained-record export")
                         continue
                     if isinstance(data.get('record_type'), str) and isinstance(data.get('payload'), dict):
                         record = imported_message(data, path=path, line=line_number, default_tz=default_tz,

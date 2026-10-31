@@ -8,8 +8,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .conversation_records import UNKNOWN, classify_conversation_record
 from .records import Record, text_from_item
 from .timeutil import parse_datetime
+
+
+_MESSAGE_TYPES = {'message', 'user_message', 'agent_message', 'assistant_message'}
+_FUNCTION_CALL_TYPES = {'function_call', 'custom_tool_call'}
+_FUNCTION_OUTPUT_TYPES = {'function_call_output', 'custom_tool_call_output'}
+_ACTION_TYPES = {'CommandExecution', 'CollabAgentToolCall', 'FileChange'}
 
 
 def imported_message(data: dict, *, path: Path, line: int, default_tz,
@@ -24,17 +31,17 @@ def imported_message(data: dict, *, path: Path, line: int, default_tz,
         'assistant_message': 'assistant'}.get(message_type)
     text = ''
     text_field = None
-    if message_type in {'function_call', 'custom_tool_call'}:
+    if message_type in _FUNCTION_CALL_TYPES:
         role = 'tool'
         arguments = message.get('arguments', message.get('input', ''))
         if not isinstance(arguments, str):
             arguments = json.dumps(arguments, ensure_ascii=False)
         text = f"{message.get('name') or 'function_call'} {arguments}"
-    elif message_type in {'function_call_output', 'custom_tool_call_output'}:
+    elif message_type in _FUNCTION_OUTPUT_TYPES:
         role = 'tool'
         text = text_from_item(message.get('output'))
         text_field = 'output'
-    elif message_type in {'CommandExecution', 'CollabAgentToolCall', 'FileChange'}:
+    elif message_type in _ACTION_TYPES:
         role = 'tool'
         # Event fields describe the declared action/result only. Do not infer
         # a paired call, session edge or successful child execution.
@@ -52,8 +59,8 @@ def imported_message(data: dict, *, path: Path, line: int, default_tz,
         text = message_type + ('\n' + '\n'.join(parts) if parts else '')
     elif message.get('projection_notice') and isinstance(message.get('text'), str):
         role, text, text_field = 'unattributed', message['text'], 'text'
-    elif role in {'user', 'assistant', 'tool', 'system', 'developer'} and message_type in {
-            None, 'message', 'user_message', 'agent_message', 'assistant_message'}:
+    elif role in {'user', 'assistant', 'tool', 'system', 'developer'} and (
+            message_type is None or message_type in _MESSAGE_TYPES):
         for key in ('text', 'content', 'message'):
             value = text_from_item(message.get(key))
             if value:
@@ -94,6 +101,39 @@ def imported_message(data: dict, *, path: Path, line: int, default_tz,
         raw=data, source_format='projected_message_jsonl' if projected else
             'imported_message_jsonl' if locator == '#' else 'imported_message_array_json',
         provider='imported', import_provenance=provenance)
+
+
+def retained_record(data: dict, *, path: Path, line: int, default_tz) -> Record | None:
+    """Read one explicit export wrapper without trusting its claimed origin."""
+    inner = data.get('record')
+    if not isinstance(data.get('source_ref'), str) or not isinstance(inner, dict):
+        return None
+    if not isinstance(inner.get('type'), str):
+        return None
+    message, locator = inner, '#/record'
+    if inner.get('type') in {'response_item', 'event_msg'}:
+        message, locator = inner.get('payload'), '#/record/payload'
+    if not isinstance(message, dict) or not isinstance(message.get('type'), str):
+        return None
+    if message['type'] not in (_MESSAGE_TYPES | _FUNCTION_CALL_TYPES | _FUNCTION_OUTPUT_TYPES | _ACTION_TYPES):
+        return None
+    # The embedded clock is a declaration. The outer wrapper never supplies
+    # time, identity or an instruction to open the claimed original source.
+    if 'created_at' not in message and 'timestamp' not in message:
+        message = {**message, 'timestamp': inner.get('timestamp', inner.get('created_at'))}
+    record = imported_message(data, path=path, line=line, default_tz=default_tz,
+        message=message, locator=locator, projected=False)
+    if record is None:
+        return None
+    record.source_format = 'retained_record_jsonl'
+    provenance = record.import_provenance
+    provenance['attribution'] = 'declared_retained_record'
+    provenance['claimed_origin'] = {'value': data['source_ref'], 'status': 'unverified_claim_only'}
+    if record.role == 'user':
+        classification = classify_conversation_record({'role': record.role, 'text': record.text})
+        if classification.label != UNKNOWN:
+            provenance['request_boundary'] = None
+    return record
 
 
 def retained_excerpt(data: dict, *, path: Path) -> Record:
