@@ -3317,6 +3317,8 @@ def expanded_record(
         "text_truncated": projected["truncated"],
         "text_suppressed": projected["suppressed"],
     }
+    if getattr(record, 'import_provenance', None) is not None:
+        row['import_provenance'] = record.import_provenance
     return row
 
 
