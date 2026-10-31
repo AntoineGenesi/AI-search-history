@@ -6,6 +6,7 @@ raw wrappers remain available without becoming native provider transports.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from .conversation_records import UNKNOWN, classify_conversation_record
@@ -17,6 +18,54 @@ _MESSAGE_TYPES = {'message', 'user_message', 'agent_message', 'assistant_message
 _FUNCTION_CALL_TYPES = {'function_call', 'custom_tool_call'}
 _FUNCTION_OUTPUT_TYPES = {'function_call_output', 'custom_tool_call_output'}
 _ACTION_TYPES = {'CommandExecution', 'CollabAgentToolCall', 'FileChange'}
+_DOCUMENTARY_ROLE = 'human_self_mail_document'
+_DOCUMENTARY_DESCRIPTIONS = ('representation', 'historical_agent_timestamp', 'historical_agent_role')
+_DOCUMENTARY_FIELDS = {'role', 'document_alias', 'timestamp', 'text', *_DOCUMENTARY_DESCRIPTIONS}
+
+
+def is_documentary_report(data: dict) -> bool:
+    """Reserve documentary declarations even when their schema is malformed."""
+    return data.get('role') == _DOCUMENTARY_ROLE or (
+        'document_alias' in data and any(key in data for key in _DOCUMENTARY_DESCRIPTIONS))
+
+
+def documentary_report(data: dict, *, path: Path, line: int) -> Record | None:
+    """Preserve a declared document; its mailbox clock never dates quoted actions."""
+    if set(data) != _DOCUMENTARY_FIELDS or any(
+            not isinstance(value, str) or not value.strip() for value in data.values()):
+        return None
+    if data['role'] != _DOCUMENTARY_ROLE:
+        return None
+    raw_timestamp = data['timestamp']
+    try:
+        timestamp = datetime.fromisoformat(
+            raw_timestamp[:-1] + '+00:00' if raw_timestamp.endswith('Z') else raw_timestamp)
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        return None
+    provenance = {
+        'attribution': 'declared_documentary_report',
+        'declared_role': data['role'],
+        'declared_timestamp': raw_timestamp,
+        'clock_basis': 'mailbox_document_cutoff_only',
+        'request_boundary': None,
+        'native_authorship_verified': False,
+        'value_locator': '#/text',
+        'text_coordinate_basis': 'utf8_bytes_of_decoded_documentary_text',
+        'documentary_metadata': {
+            'document_alias': data['document_alias'],
+            **{key: data[key] for key in _DOCUMENTARY_DESCRIPTIONS},
+        },
+        'coverage_notes': [
+            'Documentary declarations do not establish native authors, action clocks, sessions, workers, parents or call pairs.',
+        ],
+    }
+    return Record(path=str(path), line=line, role='unattributed', text=data['text'],
+        timestamp=timestamp, raw_timestamp=raw_timestamp,
+        timestamp_quality='declared_documentary_mailbox', raw=data,
+        source_format='documentary_mail_jsonl', provider='imported',
+        source_ref=f'{path}:{line}', import_provenance=provenance)
 
 
 def imported_message(data: dict, *, path: Path, line: int, default_tz,
