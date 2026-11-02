@@ -91,10 +91,6 @@ def native_passage(record, mask_context, *, kind='matched_excerpt', speaker=None
                         'gaps': []}}
     if record.source_refs:
         item['source_refs'] = list(record.source_refs)
-    if record.import_provenance is not None:
-        item['source_format'] = record.source_format
-        item['import_provenance'] = record.import_provenance
-        item['passage']['coordinate_basis'] = record.import_provenance['text_coordinate_basis']
     return item, best
 
 
@@ -126,15 +122,14 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                     record = next(state['reader'])
                     state['records'] += 1
                     raw = record.raw or {}
-                    imported = record.import_provenance is not None
                     payload = raw.get('payload', raw)
-                    if not imported and raw.get('type') == 'session_meta' and isinstance(payload, dict):
+                    if raw.get('type') == 'session_meta' and isinstance(payload, dict):
                         session = payload.get('id') or payload.get('session_id')
                         state['session'] = hashlib.sha256(str(session).encode()).hexdigest() if session else None
                         state['worker'] = payload.get('thread_source') == 'subagent' or (
                             isinstance(payload.get('source'), dict) and 'subagent' in payload['source'])
                         continue
-                    if not imported and raw.get('type') == 'turn_context' and isinstance(payload, dict):
+                    if raw.get('type') == 'turn_context' and isinstance(payload, dict):
                         turn = payload.get('turn_id')
                         state['turn'] = hashlib.sha256(str(turn).encode()).hexdigest() if turn else None
                         state['last_native'] = None
@@ -142,17 +137,16 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                         continue
                     if not record.text.strip():
                         continue
-                    classification = classify_conversation_record(
-                        {'role': record.role, 'text': record.text} if imported else record)
-                    speaker = record.role if imported else logical_speaker(record, classification)
+                    classification = classify_conversation_record(record)
+                    speaker = logical_speaker(record, classification)
                     if not visible(record, intent, speaker):
                         continue
-                    if not imported and classification.label in {COMPACTED_HISTORY_SUMMARY, INJECTED_ENVIRONMENT_CONTEXT,
+                    if classification.label in {COMPACTED_HISTORY_SUMMARY, INJECTED_ENVIRONMENT_CONTEXT,
                                                 TURN_CONTROL_OR_STATUS}:
                         controls += 1
                         continue
                     kind = raw.get('type')
-                    if not imported and state['session'] and record.timestamp and kind in {'response_item', 'event_msg'}:
+                    if state['session'] and record.timestamp and kind in {'response_item', 'event_msg'}:
                         signature = (classification.label, record.timestamp.isoformat(), hashlib.sha256(record.text.encode()).hexdigest())
                         previous = state['mirrors'].get(signature)
                         last = state['last_native']
@@ -168,14 +162,10 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                             del state['mirrors'][next(iter(state['mirrors']))]
                     plain_user = (classification.label == UNKNOWN and record.role == 'user'
                         and raw.get('role') == 'user' and not raw.get('type') and isinstance(raw.get('text'), str))
-                    declared_start = (imported and record.role == 'user'
-                        and record.import_provenance.get('request_boundary') == 'declared_user_message'
-                        and classification.label == UNKNOWN)
-                    opening = declared_start if imported else classification.is_human_authored or plain_user
+                    opening = classification.is_human_authored or plain_user
                     if opening:
                         observed, value = native_passage(record, mask_context,
-                            kind='declared_user_message_start' if imported else
-                                'worker_assignment_start' if state['worker'] else 'human_message_start',
+                            kind='worker_assignment_start' if state['worker'] else 'human_message_start',
                             speaker=speaker, message_start=True)
                         observed_cost = len(json.dumps(observed, ensure_ascii=False).encode())
                         opening_cost -= state['opening_cost']
@@ -273,8 +263,6 @@ def union_native_views(views):
         'complete': len(spans) == 1 and spans[0]['text_byte_start'] == 0
                     and spans[0]['text_byte_end'] == original_bytes,
         'spans': spans, 'gaps': gaps}
-    if item.get('import_provenance'):
-        item['passage']['coordinate_basis'] = item['import_provenance']['text_coordinate_basis']
     return item
 
 
