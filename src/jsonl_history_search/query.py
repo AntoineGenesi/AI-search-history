@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .expansion import SEMANTIC_LOCAL, expand_query_terms, task_slug_variants
-from .timeutil import local_day_window
+from .timeutil import local_day_window, parse_datetime
 
 MAX_BASE_TERMS = 64
 
@@ -155,6 +155,8 @@ class QueryIntent:
     expansion_reasons: dict[str, list[str]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     query_plan: QueryPlan | None = None
+    chronology_mode: str | None = None
+    interval_origin: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -175,6 +177,8 @@ class QueryIntent:
             "artifact_hints": self.artifact_hints,
             "warnings": self.warnings,
             "query_plan": self.query_plan.to_dict() if self.query_plan else None,
+            "chronology_mode": self.chronology_mode,
+            "interval_origin": self.interval_origin,
         }
 
 
@@ -186,8 +190,24 @@ def infer_query(
     date_window_start: datetime | None = None,
     date_window_end: datetime | None = None,
     date_reason: str | None = None,
+    natural_timezone_declared: bool = False,
 ) -> QueryIntent:
     normalized = " ".join(query.lower().split())
+    recap = is_narrative_history_recap(query)
+    interval_origin = None
+    if recap:
+        natural = supplied_recap_window(query, now.tzinfo, timezone_declared=natural_timezone_declared)
+        if natural:
+            natural_start, natural_end = natural
+            if date_window_start is not None and (date_window_start != natural_start or date_window_end != natural_end):
+                raise ValueError("Recap prose bounds conflict with --since/--until; provide one consistent interval.")
+            if date_window_start is None:
+                date_window_start, date_window_end = natural
+                date_reason = "explicit_prose_window"
+        if date_window_start is not None and date_window_end is not None:
+            if date_window_end <= date_window_start:
+                raise ValueError("Recap interval end must be later than its start.")
+            interval_origin = date_reason or "supplied_record_time_window"
     inferred_role = role or infer_role(normalized)
     role_filter_explicit = role is not None
     inferred_start, inferred_end, inferred_reason = infer_date_window(normalized, now)
@@ -239,6 +259,8 @@ def infer_query(
         expansion_reasons=expanded.reasons,
         warnings=warnings,
         query_plan=query_plan,
+        chronology_mode='supplied_interval' if interval_origin else 'latest_human' if is_direct_latest_message_history_query(query) else None,
+        interval_origin=interval_origin,
     )
 
 
@@ -363,7 +385,7 @@ def infer_role(normalized: str) -> str | None:
     return None
 
 
-def is_direct_latest_message_history_query(query):
+def _recap_text(query):
     # Classify only; native request identity always receives the original text.
     text = ' '.join(query.lower().replace('’', "'").split())
     text = re.sub(r"\b(you|we|what)'ve\b", r'\1 have', text)
@@ -373,11 +395,52 @@ def is_direct_latest_message_history_query(query):
         r'what (?:(?:have you|have we) (?:done|been doing)|did (?:you|we) do|has been (?:happening|going on))\b|catch me up\b|'
         r'summari[sz]e\b|recap\b|(?:give|provide) (?:me )?(?:a |an )?(?:recap|summary|update|progress update)\b|update me\b)', text)
     if not recap:
-        return False
+        return text, False
     # Conversational framing and a target named before the recap are allowed;
     # an implementation/causal question about recaps is a different operation.
     prefix = text[:recap.start()]
     if re.search(r'\b(?:why|how|implement|debug|fix|test|code|routing|predicate)\b', prefix):
+        return text, False
+    return text, True
+
+
+def is_narrative_history_recap(query):
+    text, recap = _recap_text(query)
+    # A request to summarize a cause still asks for topical evidence.
+    return recap and not re.search(r'\b(?:why|how)\b', text)
+
+
+def supplied_recap_window(query, default_tz, *, timezone_declared=False):
+    """Only an unambiguous inclusive-start/exclusive-end ISO relation is admitted.
+
+    Date-only, relative, competing and inclusive-end spans need clarification;
+    their interpretation must not silently select an unrelated native human.
+    """
+    date = r'\d{4}-\d{2}-\d{2}'
+    instant = date + r'[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})?'
+    dates = list(re.finditer(date, query))
+    if not dates:
+        return None
+    spans = list(re.finditer(r'\b(?:from|since)\s+(' + instant + r')\s+(?:until|before)\s+(' + instant + r')(?![\w:+-])', query, re.I))
+    if len(spans) != 1 or len(dates) != 2:
+        raise ValueError("Unresolved recap interval: use 'from <ISO timestamp> until <ISO timestamp>' (exclusive end), or --since/--until; date-only, through/to and competing bounds are ambiguous.")
+    if re.search(r'\b(?:inclusive|inclusively|exclusively|including|excluding)\b', query, re.I):
+        raise ValueError("Qualified recap endpoint inclusion is unresolved; use --since (inclusive) and --until (exclusive).")
+    endpoints = spans[0].groups()
+    if not timezone_declared and any(not re.search(r'(?:Z|[+-]\d{2}:\d{2})$', value, re.I) for value in endpoints):
+        raise ValueError("Recap prose timestamps need offsets or an explicit --timezone/--timezone-offset.")
+    parsed = tuple(parse_datetime(value.replace('t', 'T').replace('z', 'Z'), default_tz) for value in endpoints)
+    if any(value is None for value in parsed) or parsed[1] <= parsed[0]:
+        raise ValueError("Recap interval needs valid ISO timestamps with end later than start.")
+    for source, value in zip(endpoints, parsed):
+        if not re.search(r'(?:Z|[+-]\d{2}:\d{2})$', source, re.I) and value.replace(fold=0).utcoffset() != value.replace(fold=1).utcoffset():
+            raise ValueError("Ambiguous or nonexistent local recap clock time; supply explicit ISO offsets.")
+    return parsed
+
+
+def is_direct_latest_message_history_query(query):
+    text, recap = _recap_text(query)
+    if not recap:
         return False
     latest = r'(?:last|latest|most recent|previous)'
     human = r'(?:(?:genuine(?:ly)?|actual|real|human(?:-authored)?|user)\s+)*'

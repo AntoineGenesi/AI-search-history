@@ -595,6 +595,8 @@ def render_history_evidence(payload: dict) -> str:
         chronology = payload['chronology']
         lines.append('Chronological scope: ' + chronology['scope'])
         lines.append('Supported chronology complete: ' + str(payload['coverage']['complete']))
+        if chronology.get('boundary'):
+            lines.append('Acquisition boundary: ' + json.dumps(chronology['boundary'], ensure_ascii=False))
         anchor = chronology.get('anchor')
         if anchor:
             label = 'Human boundary candidate' if (chronology.get('request_boundary') or {}).get('status') == 'uncertain' else 'Human boundary'

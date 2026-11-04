@@ -1739,12 +1739,12 @@ def add_common_args(parser: argparse.ArgumentParser, *, retrieval: bool = True) 
     parser.add_argument("--max-matches", type=int, default=40)
     parser.add_argument("--max-elapsed", type=float, default=15.0)
     parser.add_argument("--timezone", default=None)
-    parser.add_argument("--timezone-offset", default="+00:00")
+    parser.add_argument("--timezone-offset", default=None)
     parser.add_argument("--now", default=None)
     parser.add_argument(
         "--since",
         default=None,
-        help="Inclusive ISO-8601 start timestamp for an explicit record search window; requires --until.",
+        help="Inclusive ISO-8601 record-time start; requires --until. Narrative recaps acquire ordered interval evidence; other questions retain search filters.",
     )
     parser.add_argument(
         "--until",
@@ -1883,6 +1883,7 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
         date_window_start=explicit_window_start,
         date_window_end=explicit_window_end,
         date_reason="explicit_cli_window" if explicit_window_start is not None else None,
+        natural_timezone_declared=bool(args.timezone or args.timezone_offset),
     )
     current_session_only = (
         getattr(args, "command", None) == "semantic-wrapup"
@@ -3214,11 +3215,14 @@ def main(argv: list[str] | None = None) -> int:
             print("ask requires the original question", file=sys.stderr)
             return 2
         budget = OperationBudget(limit_bytes=min(args.max_bytes, args.hard_cap_bytes) if args.hard_cap_bytes else args.max_bytes, max_elapsed=args.max_elapsed)
-        _source_plan, intent, plan = payload_from_args(args)
+        try:
+            _source_plan, intent, plan = payload_from_args(args)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         from .history_answer import retrieve_chronological_evidence
-        from .query import is_direct_latest_message_history_query
         default_tz = timezone_from_args(args.timezone, args.timezone_offset)
-        operation = retrieve_chronological_evidence if is_direct_latest_message_history_query(args.query) else retrieve_history_evidence
+        operation = retrieve_chronological_evidence if intent.chronology_mode else retrieve_history_evidence
         extra = {'cutoff': parse_now(_source_plan['now'], default_tz), 'requested_cwd': args.cwd,
                  'live_request': args.now is None, 'explicit_roots': bool(args.root)} if operation is retrieve_chronological_evidence else {}
         payload = operation(query=args.query, intent=intent, plan=plan,
