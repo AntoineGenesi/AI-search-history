@@ -118,6 +118,22 @@ def discover_native_sessions(files, *, plan, budget, default_tz, on_metadata=Non
     return metadata, errors
 
 
+def resolve_native_target(sessions, request_session, *, parent_requested, main_requested):
+    """One scope policy for discovered metadata and confined explicit sources."""
+    owners = [session for session in sessions if request_session and session.session == request_session]
+    if len(owners) != 1:
+        return None, 'unresolved', 'requesting native owner missing or conflicting; no unique target verified'
+    owner = owners[0]
+    needs_parent = parent_requested or (main_requested and (owner.parent or owner.worker or owner.parent_conflict))
+    if not needs_parent:
+        return owner, 'requesting_session', None
+    parents = [session for session in sessions if owner.parent and session.session == owner.parent]
+    if (len(parents) == 1 and not parents[0].worker and not owner.parent_conflict
+            and owner.parent != owner.session):
+        return parents[0], 'proven_parent', None
+    return owner, 'unverified_parent', 'requested native parent missing, conflicting or unavailable; own-session candidate activity only'
+
+
 INTERVAL_FIELDS = ('anchor', 'anchor_time', 'entries', 'pending', 'retained_cost',
                    'after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped')
 
@@ -500,6 +516,37 @@ def report_ref(ref):
     return location + ('[content %s]' % ref['content_index'] if 'content_index' in ref else '')
 
 
+def report_text(entry, allowance):
+    """Literal retained prefix plus nonoverlapping supplemental native spans."""
+    prefix = clip(entry.get('text', ''), allowance)
+    spans = [(0, prefix)] if prefix else []
+    remaining = allowance - len(prefix.encode())
+    end = len(prefix.encode())
+    for span in sorted(entry.get('outcome_spans', []), key=lambda value: value['text_byte_start']):
+        start = span['text_byte_start']
+        data = span['text'].encode()
+        # Prefix/span overlap is the same literal source range, never a second
+        # piece of evidence or extra covered bytes.
+        skipped = max(0, end - start)
+        value = clip(data[skipped:].decode('utf-8'), remaining)
+        if value:
+            start += skipped
+            spans.append((start, value))
+            remaining -= len(value.encode())
+            end = start + len(value.encode())
+    end, gaps = 0, []
+    for start, text in spans:
+        if start > end:
+            gaps.append((end, start))
+        end = start + len(text.encode())
+    original = entry.get('original_text_bytes')
+    if original is not None and end < original:
+        gaps.append((end, original))
+    body = '\n'.join('text bytes [%s,%s):\n%s' % (start, start + len(text.encode()), text)
+                     for start, text in spans)
+    return body, gaps, original
+
+
 def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_complete,
                       temporal_complete, pending, masked, budget, request_boundary=None, native_snapshot=None):
     """One structural union, serialized once; no topic ranking or source reread."""
@@ -511,8 +558,7 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
     for entry in entries:
         budget.check('chronology_report')
         classes[entry['kind']] = classes.get(entry['kind'], 0) + 1
-        brief = entry['kind'] == 'tool_result' and entry['text_complete'] and len(entry['text'].encode()) <= 512
-        if entry['kind'] == 'reported_claim' or brief or entry.get('outcome_spans'):
+        if entry['kind'] in {'reported_claim', 'tool_result'}:
             selected[key(entry['source_ref'])] = entry
             if entry.get('invocation_ref'):
                 ref = entry['invocation_ref']
@@ -528,7 +574,9 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
         'L123 denotes this source line 123; bytes=start:end:sha256 binds an exact physical record to Source (Source#bytes=...). Line 0 means physical line unknown. Content indices identify native parts. Native order, not timestamp rank.\n'
         'ASSISTANT REPORT is unverified narrative; RETURNED OUTPUT is actual returned text. Native channel/origin/tool name unknown unless shown.\n'
         'Invocation preview limited to already-complete text <=256 bytes. Invocation arguments omitted: clipped or longer; refs do not prove unseen arguments.\n'
-        'Projection: all retained reports, existing disposition spans, every complete result <=512 bytes, paired and unresolved invocation refs. Child activity not established complete.\n\n') % (
+        'Projection: every retained assistant report and returned result, with paired/unresolved invocation refs. Disposition spans supplement literal prefixes. Child activity not established complete.\n'
+        'Readback: use read-more <Source>:<line> --mode record for L<line>, or read-more <Source>#<bytes locator> --mode record for bytes=...; content indices identify the part within that native record. Reuse the admitted root.\n'
+        'Text byte offsets describe the retained normalized/masked text; original byte size and omitted gaps do not imply unseen content. Projection coverage does not imply complete returned text.\n\n') % (
             anchor['source_ref']['path'], scope, scope == 'proven_parent', report_ref(anchor['source_ref']),
             anchor['text'], cutoff.isoformat(), source_complete, temporal_complete,
             json.dumps(omissions, separators=(',', ':')), bool(masked))
@@ -538,58 +586,93 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
         header += 'Native snapshot: ' + json.dumps(native_snapshot, separators=(',', ':')) + '\n\n'
     if request_boundary:
         header += 'Request boundary: ' + json.dumps(request_boundary, separators=(',', ':')) + '\n\n'
-    blocks, emitted_classes = [], {}
-    for ref, entry in sorted(selected.items()):
-        budget.check('chronology_report')
-        kind = entry['kind']
-        label = 'ASSISTANT REPORT' if kind == 'reported_claim' else 'RETURNED OUTPUT' if kind == 'tool_result' else 'UNRESOLVED INVOCATION' if ref in unresolved else 'INVOCATION'
-        fields = [report_ref(entry['source_ref']), label]
-        for field in ('authorship', 'native_channel', 'native_origin', 'tool_name'):
-            if entry.get(field):
-                fields.append('%s=%s' % (field, entry[field]))
-        if kind == 'tool_result':
-            fields.append('invocation ' + report_ref(entry['invocation_ref']) if entry.get('invocation_ref') else 'association unavailable')
-        if entry.get('native_mirror_lines'):
-            fields.append('mirrors ' + ','.join('L%s' % n for n in entry['native_mirror_lines']))
-        if entry.get('native_mirror_refs'):
-            fields.append('mirrors ' + ','.join(report_ref(ref) for ref in entry['native_mirror_refs']))
-        text = entry.get('text', '')
-        if kind == 'tool_invocation':
-            text = text if entry.get('text_complete') and len(text.encode()) <= 256 else ''
-        elif kind == 'tool_result' and not (entry['text_complete'] and len(text.encode()) <= 512):
-            spans = entry.get('outcome_spans', [])
-            text = '\n'.join('text bytes [%s,%s):\n%s' % (s['text_byte_start'], s['text_byte_end'], s['text']) for s in spans)
-            end, gaps = 0, []
-            for span in spans:
-                if span['text_byte_start'] > end:
-                    gaps.append('[%s,%s)' % (end, span['text_byte_start']))
-                end = span['text_byte_end']
-            if end < entry['original_text_bytes']:
-                gaps.append('[%s,%s)' % (end, entry['original_text_bytes']))
-            text += '\nomitted text gaps: ' + ','.join(gaps)
-        elif not entry.get('text_complete'):
-            fields.append('CLIPPED [%s,%s) omitted' % (len(text.encode()), entry['original_text_bytes']))
-        blocks.append((ref, kind, (' | '.join(fields) + '\n' + (text + '\n' if text else '') + '\n').encode()))
-        emitted_classes[kind] = emitted_classes.get(kind, 0) + 1
-    def footer(count):
+    ordered = sorted(selected.items())
+    def blocks_for(allowance):
+        blocks = []
+        for ref, entry in ordered:
+            budget.check('chronology_report')
+            kind = entry['kind']
+            label = 'ASSISTANT REPORT' if kind == 'reported_claim' else 'RETURNED OUTPUT' if kind == 'tool_result' else 'UNRESOLVED INVOCATION' if ref in unresolved else 'INVOCATION'
+            fields = [report_ref(entry['source_ref']), label]
+            for field in ('authorship', 'native_channel', 'native_origin', 'tool_name'):
+                if entry.get(field):
+                    fields.append('%s=%s' % (field, entry[field]))
+            if kind == 'tool_result':
+                fields.append('invocation ' + report_ref(entry['invocation_ref']) if entry.get('invocation_ref') else 'association unavailable')
+            if entry.get('native_mirror_lines'):
+                fields.append('mirrors ' + ','.join('L%s' % n for n in entry['native_mirror_lines']))
+            if entry.get('native_mirror_refs'):
+                fields.append('mirrors ' + ','.join(report_ref(value) for value in entry['native_mirror_refs']))
+            preview = allowance
+            if kind == 'tool_invocation' and not (entry.get('text_complete')
+                    and len(entry.get('text', '').encode()) <= min(256, allowance)):
+                preview = 0
+            text, gaps, original = report_text(entry, preview)
+            fields.append('original text bytes: %s' % (original if original is not None else 'unknown; invocation text not retained'))
+            fields.append('omitted text gaps: ' + (','.join('[%s,%s)' % gap for gap in gaps) or ('none' if original is not None else 'unknown')))
+            if gaps or original is None:
+                fields.append('read-more ref=' + report_ref(entry['source_ref']))
+            data = (' | '.join(fields) + '\n' + (text + '\n' if text else '') + '\n').encode()
+            blocks.append((ref, kind, data, sum(end - start for start, end in gaps)))
+        return blocks
+
+    def footer(blocks, count):
+        emitted = {}
+        for _, kind, _, _ in blocks[:count]:
+            emitted[kind] = emitted.get(kind, 0) + 1
         omitted = blocks[count:]
-        ranges = ','.join(report_ref(selected[ref]['source_ref']) for ref, _, _ in omitted)
-        excluded = {kind: n - emitted_classes.get(kind, 0) for kind, n in classes.items() if n > emitted_classes.get(kind, 0)}
-        return ('Projection complete: %s; emitted union records: %s/%s\nExcluded retained classes: %s\n'
-                'Omitted native ranges: %s\nSource/retention caveats above remain independent of projection completeness.\nEND OF BOUNDED CHRONOLOGY REPORT\n' % (
-                    not omitted, count, len(blocks), json.dumps(excluded, separators=(',', ':')), ranges or 'none')).encode()
+        # Even report-framing overflow routes omitted records by their native
+        # identities; it cannot relabel their missing previews as complete.
+        routes = []
+        for ref, kind, _, _ in omitted:
+            entry = selected[ref]
+            route = [report_ref(entry['source_ref']), kind,
+                'original text bytes=%s' % entry.get('original_text_bytes', 'unknown')]
+            if kind == 'tool_result':
+                route.append('invocation=' + report_ref(entry['invocation_ref']) if entry.get('invocation_ref') else 'association unavailable')
+            elif ref in unresolved:
+                route.append('unresolved invocation')
+            routes.append(' | '.join(route))
+        ranges = '\n'.join(routes)
+        excluded = {kind: n - emitted.get(kind, 0) for kind, n in classes.items() if n > emitted.get(kind, 0)}
+        result_gaps = sum(gaps for _, kind, _, gaps in blocks[:count] if kind == 'tool_result')
+        result_complete = not result_gaps and not any(kind == 'tool_result' for _, kind, _, _ in omitted)
+        text = ('Projection complete: %s; emitted union records: %s/%s\nExcluded retained classes: %s\n'
+                'Returned text complete: %s; omitted returned text bytes within emitted records: %s\n'
+                'Omitted previews; each complete text is omitted, use read-more for native refs:\n%s\nSource/temporal/retention/display/answer completeness remain independent of projection coverage.\nEND OF BOUNDED CHRONOLOGY REPORT\n' % (
+                    not omitted, count, len(blocks), json.dumps(excluded, separators=(',', ':')),
+                    result_complete, result_gaps, ranges or 'none')).encode()
+        return text, emitted, result_complete, result_gaps
+
     data = header.encode()
-    count, size = len(blocks), len(data) + sum(len(block) for _, _, block in blocks)
-    while count and size + len(footer(count)) > RETAIN_LIMIT:
+    # Prefer every record's membership/association over long individual previews.
+    # The finite reductions derive from actual retained bytes and the existing
+    # serialized report ceiling, not a new source or preview allowance.
+    allowance = max((len(e.get('text', '').encode()) + sum(len(span['text'].encode()) for span in e.get('outcome_spans', []))
+                     for _, e in ordered), default=0)
+    while True:
+        blocks = blocks_for(allowance)
+        count = len(blocks)
+        tail, emitted, result_complete, result_gaps = footer(blocks, count)
+        size = len(data) + sum(len(block) for _, _, block, _ in blocks)
+        if size + len(tail) <= RETAIN_LIMIT or not allowance:
+            break
+        allowance //= 2
+    while count and size + len(tail) > RETAIN_LIMIT:
+        budget.check('chronology_report')
         count -= 1
         size -= len(blocks[count][2])
-    tail = footer(count)
+        tail, emitted, result_complete, result_gaps = footer(blocks, count)
     if size + len(tail) > RETAIN_LIMIT:
         raise OSError('chronology report framing exceeds report allowance')
-    return data + b''.join(block for _, _, block in blocks[:count]) + tail, {
+    return data + b''.join(block for _, _, block, _ in blocks[:count]) + tail, {
         'records': count, 'union_records': len(blocks), 'omitted_records': len(blocks) - count,
-        'projection_complete': count == len(blocks), 'selected_classes': emitted_classes,
-        'retained_classes': classes, 'limit_bytes': RETAIN_LIMIT}
+        'projection_complete': count == len(blocks), 'selected_classes': emitted,
+        'routed_records': len(blocks) - count, 'returned_result_routes_complete': True,
+        'retained_classes': classes, 'returned_text_complete': result_complete,
+        'omitted_returned_text_bytes_in_emitted_records': result_gaps, 'requires_source_readback': count != len(blocks) or any(gaps for _, _, _, gaps in blocks)
+            or any(entry.get('original_text_bytes') is None for entry in selected.values()),
+        'limit_bytes': RETAIN_LIMIT}
 
 
 def retain_interval(entries, anchor, *, cutoff, omissions, scope, source_complete,
@@ -711,7 +794,8 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     request_turn = os.environ.get('CODEX_TURN_ID')
     discovery_errors, metadata = [], []
     target, target_scope = None, None
-    parent_requested = bool(re.search(r'\b(?:parent|main)\s+(?:thread|session|conversation|chat)\b', query.lower()))
+    parent_requested = bool(re.search(r'\bparent\s+(?:thread|session|conversation|chat)\b', query.lower()))
+    main_requested = bool(re.search(r'\bmain\s+(?:thread|session|conversation|chat)\b', query.lower()))
     priority = [request_session]
     files = []
     def admitted_files():
@@ -720,25 +804,16 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             files.append(item)
             yield item
     def observe_owner(state):
-        if state.session == request_session and state.parent and parent_requested:
+        if state.session == request_session and state.parent and (parent_requested or main_requested):
             priority.insert(0, state.parent)
 
     if not explicit_roots:
         metadata, discovery_errors = discover_native_sessions(admitted_files(), plan=plan, budget=budget,
             default_tz=default_tz, on_metadata=observe_owner)
-        owners = [s for s in metadata if request_session and s.session == request_session]
-        if len(owners) == 1:
-            owner = owners[0]
-            target, target_scope = owner, 'requesting_session'
-            if parent_requested:
-                parents = [s for s in metadata if owner.parent and s.session == owner.parent and not s.worker]
-                if len(parents) == 1 and not owner.parent_conflict:
-                    target, target_scope = parents[0], 'proven_parent'
-                else:
-                    target_scope = 'unverified_parent'
-                    discovery_errors.append({'reason': 'requested native parent missing, conflicting or unavailable; own-session candidate activity only'})
-        else:
-            discovery_errors.append({'reason': 'requesting native owner missing or conflicting; no unique target verified'})
+        target, target_scope, diagnostic = resolve_native_target(metadata, request_session,
+            parent_requested=parent_requested, main_requested=main_requested)
+        if diagnostic:
+            discovery_errors.append({'reason': diagnostic})
     else:
         list(admitted_files())
     scan_files = [f for f in files if f[0] == target.path] if target else files if explicit_roots else []
@@ -782,11 +857,19 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     errors.extend(stats.partial_failures or [])
     candidates = [s for s in states if s.anchor and not s.worker]
     requesting = [s for s in states if s.session == request_session] if request_session else []
-    parent = requesting[0].parent if len(requesting) == 1 else None
-    parents = [s for s in candidates if s.session == parent] if parent else []
-    scope = 'proven_parent' if len(parents) == 1 else 'selected_session' if len(candidates) == 1 and not parent else 'ambiguous_sessions' if candidates else 'unavailable_session'
-    chosen = parents[0] if scope == 'proven_parent' else candidates[0] if scope == 'selected_session' else None
-    if not explicit_roots:
+    chosen = candidates[0] if len(candidates) == 1 else None
+    scope = 'selected_session' if chosen else 'ambiguous_sessions' if candidates else 'unavailable_session'
+    if explicit_roots and requesting:
+        selected, selected_scope, diagnostic = resolve_native_target(states, request_session,
+            parent_requested=parent_requested, main_requested=main_requested)
+        chosen = selected if selected and selected.anchor and not selected.worker else None
+        scope = selected_scope if chosen else 'ambiguous_sessions' if candidates else 'unavailable_session'
+        if diagnostic:
+            errors.append({'reason': diagnostic})
+    elif explicit_roots and (parent_requested or main_requested):
+        scope = 'unverified_parent' if parent_requested else 'unverified_main'
+        errors.append({'reason': 'requesting native ownership unavailable; selected-source evidence does not verify the requested relationship'})
+    elif not explicit_roots:
         chosen = states[0] if target and states and states[0].anchor else None
         scope = target_scope if chosen else 'ambiguous_sessions' if candidates else 'unavailable_session'
         if not target:
@@ -820,9 +903,6 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
     if artifact and artifact['omitted_records']:
         omissions['artifact_records'] = artifact['omitted_records']
-    if explicit_roots and parent and not parents:
-        errors.append({'reason': 'native requesting-side parent is outside or unavailable in admitted scope'})
-        complete = False
     limit = max(0, min(30, plan.limits.max_matches))
     allowance = TEXT_LIMIT - len((chosen.anchor['text'] if chosen else '').encode())
     def present(allowance):
