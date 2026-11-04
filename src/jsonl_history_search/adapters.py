@@ -153,13 +153,18 @@ class JsonlAdapter:
         budget=None, budget_phase="retrieval", native_scan=None,
     ) -> Iterable[Record]:
         def lines():
-            if native_scan is not None:
-                yield from native_jsonl_lines(path, budget=budget, phase=budget_phase,
-                    scan=native_scan, stats=raw_line_stats)
-            else:
-                with open_source_text(path, budget=budget, phase=budget_phase) as handle:
-                    for number, line in enumerate(handle, 1):
-                        yield number, line, None
+            try:
+                if native_scan is not None:
+                    yield from native_jsonl_lines(path, budget=budget, phase=budget_phase,
+                        scan=native_scan, stats=raw_line_stats)
+                else:
+                    with open_source_text(path, budget=budget, phase=budget_phase) as handle:
+                        for number, line in enumerate(handle, 1):
+                            yield number, line, None
+            except (BudgetExceeded, AdapterReadError):
+                raise
+            except OSError as exc:
+                raise AdapterReadError(f"Could not read {path}: {exc}") from exc
         for line_number, line, native_ref in lines():
             if raw_line_stats is not None:
                 raw_line_stats.raw_lines_examined += 1
