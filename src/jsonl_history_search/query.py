@@ -431,14 +431,20 @@ def supplied_recap_window(query, default_tz, *, timezone_declared=False):
     endpoint_suffix = query[spans[0].end():]
     if re.match(r'\s*,?\s*(?:or|and)\s+' + date, endpoint_suffix, re.I):
         raise ValueError("Competing recap endpoints are unresolved; provide one interval.")
-    # 'Including failures' qualifies recap contents. Inclusion is temporal only
-    # when attached to an endpoint itself, an endpoint noun, or another instant.
-    endpoint_noun = (r'(?:(?:the|both|this|that)\s+)?(?:(?:lower|upper|first|last|initial|final)\s+)?'
+    # The parsed span supplies endpoint referents: scope words can qualify them
+    # with or without a repeated noun. Inclusion verbs still need a temporal
+    # object, so recap contents such as 'including failures' remain separate.
+    endpoint_scope = r'(?:both|each|either|neither|all)'
+    endpoint_noun = (r'(?:(?:the|this|that|' + endpoint_scope + r')\s+)?'
+                     r'(?:(?:lower|upper|first|last|initial|final)\s+)?'
                      r'(?:(?:start|end)(?:ing)?(?:\s+point)?s?|endpoints?|bounds?|boundar(?:y|ies)|dates?|timestamps?|instants?)\b')
-    inclusion = (r'(?:inclusive(?:ly)?\b|exclusively\b|(?:and\s+)?(?:including|excluding)\s+(?:'
-                 + endpoint_noun + '|' + date + ')|' + endpoint_noun
-                 + r'\s+(?:(?:is|are)\s+)?(?:inclusive|exclusive)\b)')
-    if re.match(r'\s*(?:[,;]\s*)?(?:\(\s*)?' + inclusion, endpoint_suffix, re.I):
+    endpoint_subject = r'(?:' + endpoint_noun + '|' + endpoint_scope + r'|this|that)'
+    disposition = r'(?:(?:inclusive|exclusive)(?:ly)?|included|excluded)\b'
+    qualification = (r'(?:' + endpoint_subject + r'\s+)?(?:(?:is|are|being)\s+)?'
+                     r'(?:' + endpoint_scope + r'\s+)?' + disposition)
+    inclusion = (r'(?:' + qualification + r'|(?:including|excluding)\s+(?:'
+                 + endpoint_noun + '|' + date + '))')
+    if re.match(r'\s*(?:[,;]\s*)?(?:\(\s*)?(?:(?:and|with)\s+)?' + inclusion, endpoint_suffix, re.I):
         raise ValueError("Qualified recap endpoint inclusion is unresolved; use --since (inclusive) and --until (exclusive).")
     endpoints = spans[0].groups()
     if not timezone_declared and any(not re.search(r'(?:Z|[+-]\d{2}:\d{2})$', value, re.I) for value in endpoints):
