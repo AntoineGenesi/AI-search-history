@@ -400,6 +400,20 @@ def render_text(payload: dict) -> str:
         lines.append(
             f"Partial source: {failure.get('provider') or 'unknown'} {location}: {failure.get('reason') or 'unknown'}"
         )
+    if diagnostics.get("partial_failure_count"):
+        displayed = (diagnostics.get("partial_failures") or [])[:5]
+        lines.append(
+            f"Source failures: {diagnostics['partial_failure_count']}; "
+            f"displayed={len(displayed)}; "
+            f"omitted={diagnostics['partial_failure_count'] - len(displayed)}; "
+            f"clipped={sum(e.get('text_complete') is False for e in displayed)}"
+        )
+    if payload.get("operation_source_error_count"):
+        lines.append(
+            f"Fielded source failures: {payload['operation_source_error_count']}; "
+            f"retained_examples={payload.get('operation_source_error_sample_count', 0)}; "
+            f"displayed=0; omitted={payload['operation_source_error_count']}"
+        )
     for warning in payload.get("warnings", []):
         lines.append(f"Warning: {warning}")
     for blind in payload.get("blind_spots", []):
@@ -572,6 +586,11 @@ def render_history_evidence(payload: dict) -> str:
     for field in ('cap_reasons', 'unavailable_roots', 'source_errors'):
         if payload['coverage'][field]:
             lines.append(field + ': ' + json.dumps(payload['coverage'][field], ensure_ascii=False))
+    coverage = payload['coverage']
+    if coverage.get('source_error_count'):
+        lines.append('Source failures: %s; displayed=%s; omitted=%s; clipped=%s' % (
+            coverage['source_error_count'], coverage['source_error_sample_count'],
+            coverage['source_error_omitted_count'], coverage['source_error_clipped_sample_count']))
     if 'chronology' in payload:
         chronology = payload['chronology']
         lines.append('Chronological scope: ' + chronology['scope'])

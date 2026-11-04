@@ -108,7 +108,7 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
                'opening': None, 'opening_cost': 0, 'mirrors': {},
                'turn': None, 'last_native': None,
                'session': None, 'worker': False, 'complete': False, 'records': 0} for p, _, _ in files]
-    contexts, errors, heap = {}, [], []
+    contexts, heap = {}, []
     cost = opening_cost = matched = controls = mirrors = 0
     stats = RawLineScanStats()
     limit = max(0, min(30, plan.limits.max_matches))
@@ -211,7 +211,7 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
             except BudgetExceeded:
                 finished = True
             except (AdapterReadError, OSError) as exc:
-                errors.append({'path': str(state['path']), 'reason': str(exc)})
+                stats.note_partial(path=state['path'], reason=str(exc))
                 finished = True
             if not finished:
                 queue.append(state)
@@ -219,8 +219,7 @@ def collect_contexts(*, query, intent, plan, default_tz, budget, mask_context=No
         for state in states:
             if state['reader'] is not None:
                 state['reader'].close()
-    errors.extend(stats.partial_failures or [])
-    return list(contexts.values()), {'states': states, 'errors': errors, 'matched': matched,
+    return list(contexts.values()), {'states': states, **stats.source_error_summary(), 'matched': matched,
         'records': sum(s['records'] for s in states), 'retained_cost': cost + opening_cost,
         'warnings': list(dict.fromkeys(plan.warnings)), 'controls': controls, 'mirrors': mirrors}
 
@@ -299,6 +298,11 @@ def pack_evidence(payload, contexts, output_format):
         if examples is not None:
             examples.pop()
             payload['omissions']['diagnostic_examples'] += 1
+            if examples is payload['coverage']['source_errors']:
+                coverage = payload['coverage']
+                coverage['source_error_sample_count'] = len(examples)
+                coverage['source_error_omitted_count'] = coverage['source_error_count'] - len(examples)
+                coverage['source_error_clipped_sample_count'] = sum(e.get('text_complete') is False for e in examples)
         else:
             payload['query'] = payload['query'][:len(payload['query']) // 2]
             payload['query_display']['complete'] = False
@@ -344,7 +348,7 @@ def retrieve_history_evidence(*, query, intent, plan, default_tz, budget,
     reasons = sorted(set(cap_labels_from_warnings(scan['warnings']) + budget.exhausted_reasons))
     unavailable = [str(r.path) for r in plan.roots if not r.path.exists()]
     unavailable.extend(str(r) for r in getattr(plan, 'rejected_roots', []))
-    complete = not (reasons or scan['errors'] or unavailable or any(not s['complete'] for s in scan['states']))
+    complete = not (reasons or scan['source_error_count'] or unavailable or any(not s['complete'] for s in scan['states']))
     status = 'not_found' if complete and scan['states'] else 'empty_scope' if complete else 'unavailable' if unavailable and not scan['states'] else 'partial'
     payload = {'query': query, 'status': status, 'evidence': [],
         'scope': {'roots': [str(r.path) for r in plan.roots], 'root_count': len(plan.roots),
@@ -356,7 +360,7 @@ def retrieve_history_evidence(*, query, intent, plan, default_tz, budget,
         'coverage': {'complete': complete, 'files_admitted': len(scan['states']),
             'files_read': len(budget.opened_sources), 'records_inspected': scan['records'],
             'cap_reasons': reasons, 'unavailable_roots': unavailable[:20], 'unavailable_root_count': len(unavailable),
-            'source_errors': scan['errors'][:20], 'source_error_count': len(scan['errors'])},
+            **{key: value for key, value in scan.items() if key == 'source_errors' or key.startswith('source_error_')}},
         'omissions': {'candidate_contexts': max(0, scan['matched'] - len(contexts)),
                       'presentation_contexts': 0, 'clipped_passages': 0,
                       'native_control_records': scan['controls'], 'native_event_mirrors': scan['mirrors']},

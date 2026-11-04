@@ -737,6 +737,7 @@ def build_fielded_bm25_index(
             warnings=["SQLite FTS5 is unavailable; fielded BM25 lane cannot run."],
         )
 
+    operation_stats = RawLineScanStats()
     index = FieldedBm25Index(
         connection=connection,
         metrics={
@@ -745,7 +746,6 @@ def build_fielded_bm25_index(
             "indexed_records": 0,
             "indexed_chunks": 0,
             "read_error_files": 0,
-            "operation_source_errors": [],
             "persistent_index_enabled": persistent_index_dir is not None,
             "persistent_storage_kind": "durable_sqlite_fts5" if persistent_cache is not None else "ephemeral_memory_fts5",
             "index_path_category": "user_supplied_fielded_bm25_index_dir" if persistent_cache is not None else "ephemeral_memory",
@@ -806,7 +806,7 @@ def build_fielded_bm25_index(
                 break
             except OSError as exc:
                 index.metrics["read_error_files"] += 1
-                index.metrics["operation_source_errors"].append({"path": str(path), "reason": str(exc)})
+                operation_stats.note_partial(path=path, reason=str(exc))
                 index.warnings.append(f"Could not fingerprint {path}: {exc}")
                 continue
             index.metrics["content_fingerprint_files"] += 1
@@ -933,7 +933,7 @@ def build_fielded_bm25_index(
                 connection.execute("ROLLBACK TO operation_source")
                 connection.execute("RELEASE operation_source")
             index.metrics["read_error_files"] += 1
-            index.metrics["operation_source_errors"].append({"path": str(path), "reason": str(exc)})
+            operation_stats.note_partial(path=path, reason=str(exc))
             index.warnings.append(str(exc))
             continue
         except OSError as exc:
@@ -941,13 +941,13 @@ def build_fielded_bm25_index(
                 connection.execute("ROLLBACK TO operation_source")
                 connection.execute("RELEASE operation_source")
             index.metrics["read_error_files"] += 1
-            index.metrics["operation_source_errors"].append({"path": str(path), "reason": str(exc)})
+            operation_stats.note_partial(path=path, reason=str(exc))
             index.warnings.append(f"Could not open {path}: {exc}")
             continue
         finally:
             if source_stats is not None:
-                index.metrics["operation_source_errors"].extend(source_stats.partial_failures or [])
-        source_failures = list(source_stats.partial_failures or []) if source_stats is not None else []
+                operation_stats.merge_failures(source_stats)
+        source_failure_count = source_stats.partial_failure_count if source_stats is not None else 0
         index.files[str(path)] = {
             "source_kind": source_kind,
             "record_count": file_records,
@@ -970,13 +970,13 @@ def build_fielded_bm25_index(
             )
             if budget is not None:
                 metadata.update(coverage_validation="ordinary-source-diagnostics-v1",
-                                coverage_complete=not source_failures)
+                                coverage_complete=not source_failure_count)
             segment_rows = [
                 _persistent_row_from_ref(connection, index.records[candidate_rowid])
                 for candidate_rowid in range(segment_start_rowid + 1, rowid + 1)
                 if candidate_rowid in index.records
             ]
-            if source_failures:
+            if source_failure_count:
                 # Do not publish a compatibility segment without coverage facts.
                 persistent_cache._drop_source(source_key)
             else:
@@ -1022,6 +1022,7 @@ def build_fielded_bm25_index(
             if int(index.metrics.get("sources_invalidated", 0)) or int(index.metrics.get("sources_deleted", 0))
             else "fresh"
         )
+    index.metrics.update({"operation_" + key: value for key, value in operation_stats.source_error_summary().items()})
     index.metrics["build_elapsed_ms"] = _elapsed_ms(started)
     if planned_jsonl_files is not None:
         index.metrics["planned_file_enumeration_reused"] = True

@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import hashlib
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
@@ -24,6 +24,11 @@ class AdapterReadError(OSError):
     pass
 
 
+# Reuse ordinary ask's existing example cap and chronology's diagnostic text cap.
+DIAGNOSTIC_SAMPLE_LIMIT = 20
+DIAGNOSTIC_TEXT_BYTES = 1024
+
+
 @dataclass
 class RawLineScanStats:
     raw_lines_examined: int = 0
@@ -34,14 +39,53 @@ class RawLineScanStats:
     ignored_rows: int = 0
     weak_timestamp_records: int = 0
     fallback_records: int = 0
-    partial_failures: list[dict[str, object]] | None = None
+    partial_failure_count: int = 0
+    partial_failures: list[dict[str, object]] = field(default_factory=list)
 
-    def note_partial(self, *, provider: str, path: Path, line: int | None, reason: str) -> None:
-        if self.partial_failures is None:
-            self.partial_failures = []
-        self.partial_failures.append(
-            {"provider": provider, "path": str(path), "line": line, "reason": reason}
-        )
+    def note_partial(self, *, reason: str, provider: str = "source",
+                     path: Path | None = None, line: int | None = None) -> None:
+        self.partial_failure_count += 1
+        sample: dict[str, object] = {"line": line}
+        for key, value in (("provider", provider), ("path", path), ("reason", reason)):
+            if value is not None:
+                text = str(value)
+                # Slice before encoding too: one enormous exception must not
+                # allocate another enormous encoded diagnostic at this owner.
+                clipped = text[:DIAGNOSTIC_TEXT_BYTES].encode("utf-8", errors="replace")[:DIAGNOSTIC_TEXT_BYTES].decode("utf-8", errors="ignore")
+                sample[key] = clipped
+                if clipped != text:
+                    sample["text_complete"] = False
+        self._retain_failure(sample)
+
+    def _retain_failure(self, sample: dict[str, object]) -> None:
+        key = tuple(sample.get(k) for k in ("provider", "path", "reason"))
+        if any(tuple(s.get(k) for k in ("provider", "path", "reason")) == key
+               for s in self.partial_failures):
+            return
+        if len(self.partial_failures) < DIAGNOSTIC_SAMPLE_LIMIT:
+            self.partial_failures.append(sample)
+            return
+        # Keep source variation without an ever-growing set of observed keys.
+        # A new source can replace the last extra reason from a noisy source.
+        source = (sample.get("provider"), sample.get("path"))
+        sources = [(s.get("provider"), s.get("path")) for s in self.partial_failures]
+        if source not in sources:
+            for index in range(len(sources) - 1, -1, -1):
+                if sources[index] in sources[:index]:
+                    self.partial_failures[index] = sample
+                    break
+
+    def merge_failures(self, other: RawLineScanStats) -> None:
+        self.partial_failure_count += other.partial_failure_count
+        for sample in other.partial_failures:
+            self._retain_failure(sample)
+
+    def source_error_summary(self) -> dict[str, object]:
+        return {"source_errors": list(self.partial_failures),
+                "source_error_count": self.partial_failure_count,
+                "source_error_sample_count": len(self.partial_failures),
+                "source_error_omitted_count": self.partial_failure_count - len(self.partial_failures),
+                "source_error_clipped_sample_count": sum(s.get("text_complete") is False for s in self.partial_failures)}
 
 
 class RawLinePreParseFilter(Protocol):

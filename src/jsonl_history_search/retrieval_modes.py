@@ -149,7 +149,8 @@ def run_fielded_bm25_retrieval(
         continuation_ledger=continuation_ledger,
     )
     if budget is not None:
-        fielded_result["operation_source_errors"] = list(fielded_index.metrics.get("operation_source_errors", []))
+        fielded_result.update({key: value for key, value in fielded_index.metrics.items()
+                               if key == "operation_source_errors" or key.startswith("operation_source_error_")})
         fielded_result["admitted_source_files"] = planned_jsonl_files.file_count
     fielded_count = _candidate_count(fielded_result)
     fielded_profile = finish_phase_profile(
@@ -260,7 +261,8 @@ def run_rrf_fusion_retrieval(
         query_plan_mode=query_plan_mode,
     )
     if budget is not None:
-        fielded_result["operation_source_errors"] = list(fielded_index.metrics.get("operation_source_errors", []))
+        fielded_result.update({key: value for key, value in fielded_index.metrics.items()
+                               if key == "operation_source_errors" or key.startswith("operation_source_error_")})
         fielded_result["admitted_source_files"] = planned_jsonl_files.file_count
     fielded_count = _candidate_count(fielded_result)
     fielded_profile = finish_phase_profile(
@@ -345,7 +347,8 @@ def run_rrf_fusion_retrieval(
     fused_result.update(
         {
             "retrieval_mode": RETRIEVAL_MODE_RRF_FUSION,
-            "operation_source_errors": fielded_result.get("operation_source_errors", []),
+            **{key: value for key, value in fielded_result.items()
+               if key == "operation_source_errors" or key.startswith("operation_source_error_")},
             "source_diagnostics": package_result.get("source_diagnostics", {}),
             "admitted_source_files": planned_jsonl_files.file_count,
             "preserve_match_order": True,

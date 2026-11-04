@@ -80,11 +80,11 @@ class NativeTargetIntegrityError(ValueError):
 
 def discover_native_sessions(files, *, plan, budget, default_tz, on_metadata=None):
     """Complete owning record only; every header read shares the body budget."""
-    metadata, errors, stats = [], [], RawLineScanStats()
+    metadata, stats = [], RawLineScanStats()
     for path, _, _ in files:
         kind = source_kind_for_path(path, plan)
         if path.suffix.lower() != '.jsonl' or kind.startswith(('grok_', 'gemini_', 'aider_', 'cursor_', 'opencode_')):
-            errors.append({'path': str(path), 'reason': 'native metadata target discovery unsupported'})
+            stats.note_partial(path=path, reason='native metadata target discovery unsupported')
             continue
         records = iter_records_for_file(path, kind, default_tz, raw_line_stats=stats,
                                        budget=budget, budget_phase='chronology_metadata')
@@ -107,15 +107,14 @@ def discover_native_sessions(files, *, plan, budget, default_tz, on_metadata=Non
             if on_metadata:
                 on_metadata(state)
             if state.parent_conflict:
-                errors.append({'path': str(path), 'reason': 'conflicting native direct-parent metadata'})
+                stats.note_partial(path=path, reason='conflicting native direct-parent metadata')
         except (StopIteration, OSError, ValueError, TypeError) as exc:
-            errors.append({'path': str(path), 'reason': str(exc) or 'native metadata source empty'})
+            stats.note_partial(path=path, reason=str(exc) or 'native metadata source empty')
         finally:
             records.close()
         if not budget.available('chronology_metadata'):
             break
-    errors.extend(stats.partial_failures or [])
-    return metadata, errors
+    return metadata, stats
 
 
 def resolve_native_target(sessions, request_session, *, parent_requested, main_requested):
@@ -789,10 +788,10 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
                                   cutoff, requested_cwd=None, mask_context=None, output_format='json', live_request=False,
                                   explicit_roots=True):
     cutoff = cutoff.astimezone(timezone.utc)
-    states, errors, stats = [], [], RawLineScanStats()
+    states, stats = [], RawLineScanStats()
     request_session = os.environ.get('CODEX_THREAD_ID')
     request_turn = os.environ.get('CODEX_TURN_ID')
-    discovery_errors, metadata = [], []
+    discovery_stats, metadata = RawLineScanStats(), []
     target, target_scope = None, None
     parent_requested = bool(re.search(r'\bparent\s+(?:thread|session|conversation|chat)\b', query.lower()))
     main_requested = bool(re.search(r'\bmain\s+(?:thread|session|conversation|chat)\b', query.lower()))
@@ -808,12 +807,12 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             priority.insert(0, state.parent)
 
     if not explicit_roots:
-        metadata, discovery_errors = discover_native_sessions(admitted_files(), plan=plan, budget=budget,
+        metadata, discovery_stats = discover_native_sessions(admitted_files(), plan=plan, budget=budget,
             default_tz=default_tz, on_metadata=observe_owner)
         target, target_scope, diagnostic = resolve_native_target(metadata, request_session,
             parent_requested=parent_requested, main_requested=main_requested)
         if diagnostic:
-            discovery_errors.append({'reason': diagnostic})
+            discovery_stats.note_partial(reason=diagnostic)
     else:
         list(admitted_files())
     scan_files = [f for f in files if f[0] == target.path] if target else files if explicit_roots else []
@@ -822,7 +821,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         states.append(state)
         kind = source_kind_for_path(path, plan)
         if path.suffix.lower() != '.jsonl' or kind.startswith(('grok_', 'gemini_', 'aider_', 'cursor_', 'opencode_')):
-            errors.append({'path': str(path), 'reason': 'native session boundary/ordering unsupported; ordinary provider retrieval remains available'})
+            stats.note_partial(path=path, reason='native session boundary/ordering unsupported; ordinary provider retrieval remains available')
             continue
         try:
             retained_limit = max(0, RETAIN_LIMIT - 8192 - sum(s.retained_cost for s in states))
@@ -835,7 +834,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             if state.records and not state.session:
                 state.anchor = None
                 state.entries.clear()
-                errors.append({'path': str(path), 'reason': 'native owning session/worker provenance unavailable; provider chronology unsupported'})
+                stats.note_partial(path=path, reason='native owning session/worker provenance unavailable; provider chronology unsupported')
         except NativeTargetIntegrityError as exc:
             # Finalization must not restore a pending earlier interval after
             # native identity becomes ineligible, including later contradictions.
@@ -843,18 +842,17 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             state.entries, state.pending, state.retained_cost = [], {}, 0
             state.complete = False
             target_scope = 'target_integrity_unavailable'
-            errors.append({'path': str(path), 'reason': 'target integrity: ' + str(exc)})
+            stats.note_partial(path=path, reason='target integrity: ' + str(exc))
         except (OSError, ValueError, TypeError) as exc:
-            errors.append({'path': str(path), 'reason': str(exc)})
+            stats.note_partial(path=path, reason=str(exc))
         finally:
             finalize_native_attribution(state)
             resolve_request_boundary(state, request_turn, live_request)
             finalize_native_attribution(state)
         if state.parent_conflict:
-            errors.append({'path': str(path), 'reason': 'conflicting native direct-parent metadata'})
+            stats.note_partial(path=path, reason='conflicting native direct-parent metadata')
         if not budget.available('chronology'):
             break
-    errors.extend(stats.partial_failures or [])
     candidates = [s for s in states if s.anchor and not s.worker]
     requesting = [s for s in states if s.session == request_session] if request_session else []
     chosen = candidates[0] if len(candidates) == 1 else None
@@ -865,7 +863,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         chosen = selected if selected and selected.anchor and not selected.worker else None
         scope = selected_scope if chosen else 'ambiguous_sessions' if candidates else 'unavailable_session'
         if diagnostic:
-            errors.append({'reason': diagnostic})
+            stats.note_partial(reason=diagnostic)
     elif not explicit_roots:
         chosen = states[0] if target and states and states[0].anchor else None
         scope = target_scope if chosen else 'ambiguous_sessions' if candidates else 'unavailable_session'
@@ -874,8 +872,8 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     unavailable = [str(r.path) for r in plan.roots if not r.path.exists()]
     unavailable.extend(str(r.path) for r in plan.rejected_roots)
     caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
-    discovery_complete = not (caps or discovery_errors) if not explicit_roots else None
-    source_complete = not (caps or errors or (unavailable if explicit_roots else []) or len(states) != len(scan_files) or any(not s.complete or s.native_scan.get('prefix_omitted_bytes') for s in states))
+    discovery_complete = not (caps or discovery_stats.partial_failure_count) if not explicit_roots else None
+    source_complete = not (caps or stats.partial_failure_count or (unavailable if explicit_roots else []) or len(states) != len(scan_files) or any(not s.complete or s.native_scan.get('prefix_omitted_bytes') for s in states))
     if not explicit_roots and not target:
         source_complete = False
     temporal = bool(chosen and chosen.temporal_complete)
@@ -884,7 +882,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         complete = complete and bool(discovery_complete) and scope in {'requesting_session', 'proven_parent'}
     if chosen and requested_cwd and chosen.cwd and Path(chosen.cwd).resolve() != Path(requested_cwd).resolve():
         complete = False
-        errors.append({'reason': 'selected native session cwd differs from caller cwd; useful selected-source evidence is returned without parent verification'})
+        stats.note_partial(reason='selected native session cwd differs from caller cwd; useful selected-source evidence is returned without parent verification')
     entries = chosen.entries if chosen else [s.anchor for s in candidates][:max(0, min(30, plan.limits.max_matches))]
     omissions = {'native_control_records': sum(s.controls for s in states), 'native_event_mirrors': sum(s.mirrors for s in states),
         'after_cutoff_records': sum(s.future for s in states), 'retention_records': sum(s.retention_omitted for s in states),
@@ -896,7 +894,8 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
                 scope=scope, source_complete=source_complete, temporal_complete=temporal,
                 pending=chosen.pending, masked=mask_context, budget=budget, request_boundary=chosen.request_boundary, native_snapshot=chosen.native_scan)
         except OSError as exc:
-            errors.append({'reason': 'interval artifact unavailable: ' + str(exc)})
+            stats.note_partial(reason='interval artifact unavailable: ' + str(exc))
+            complete = False
         caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
     if artifact and artifact['omitted_records']:
         omissions['artifact_records'] = artifact['omitted_records']
@@ -913,6 +912,9 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         return evidence
     evidence = present(allowance)
     display_count = sum(len(e.get('records', [e])) for e in evidence)
+    all_stats = RawLineScanStats()
+    all_stats.merge_failures(stats)
+    all_stats.merge_failures(discovery_stats)
     payload = {'query': query, 'status': 'chronological_evidence' if chosen else 'ambiguous' if candidates else 'unavailable' if not source_complete else 'not_found',
         'evidence': evidence, 'scope': {'roots': [clip(str(r.path), 2048) for r in plan.roots[:20]],
             'root_count': len(plan.roots), 'roots_display_complete': len(plan.roots) <= 20,
@@ -923,12 +925,11 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             'native_snapshots': [{'path': clip(str(s.path), 2048), **s.native_scan} for s in states[:20]],
             'native_snapshots_display_complete': len(states) <= 20,
             'files_read': len(budget.opened_sources), 'records_inspected': sum(s.records for s in states),
-            'source_errors': [{k: clip(str(v), 1024) for k, v in e.items()} for e in (errors + discovery_errors)[:20]],
-            'source_error_count': len(errors) + len(discovery_errors), 'cap_reasons': caps,
+            **all_stats.source_error_summary(), 'cap_reasons': caps,
             'unavailable_roots': [clip(p, 2048) for p in unavailable[:20]]},
         'chronology': {'scope': scope, 'anchor': chosen.anchor if chosen else None,
             'native_snapshot': chosen.native_scan if chosen else None,
-            'interval_complete': bool(chosen and chosen.complete and chosen.anchor and chosen.boundary_complete and chosen.temporal_complete and not errors),
+            'interval_complete': bool(chosen and chosen.complete and chosen.anchor and chosen.boundary_complete and chosen.temporal_complete and not stats.partial_failure_count),
             'request_boundary': chosen.request_boundary if chosen else requesting[0].request_boundary if len(requesting) == 1 else None,
             'parent_relationship_verified': scope == 'proven_parent',
             'candidate_anchors': [],
@@ -964,6 +965,9 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         elif payload['coverage']['source_errors']:
             payload['coverage']['source_errors'] = []
             payload['coverage']['errors_display_complete'] = False
+            payload['coverage']['source_error_sample_count'] = 0
+            payload['coverage']['source_error_omitted_count'] = payload['coverage']['source_error_count']
+            payload['coverage']['source_error_clipped_sample_count'] = 0
         elif payload['scope']['roots']:
             payload['scope']['roots'] = []
             payload['scope']['roots_display_complete'] = False
