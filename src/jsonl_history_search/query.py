@@ -418,13 +418,27 @@ def supplied_recap_window(query, default_tz, *, timezone_declared=False):
     """
     date = r'\d{4}-\d{2}-\d{2}'
     instant = date + r'[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})?'
-    dates = list(re.finditer(date, query))
-    if not dates:
+    # A dated subject is not a requested temporal boundary. Require a relation
+    # directly attached to a concrete endpoint before validating prose bounds.
+    attempted_endpoints = list(re.finditer(
+        r'\b(?:from|since|after|between|until|before|through|to)\s+'
+        r'(?:(?:and\s+)?(?:including|excluding)\s+)?' + date, query, re.I))
+    if not attempted_endpoints:
         return None
     spans = list(re.finditer(r'\b(?:from|since)\s+(' + instant + r')\s+(?:until|before)\s+(' + instant + r')(?![\w:+-])', query, re.I))
-    if len(spans) != 1 or len(dates) != 2:
+    if len(spans) != 1 or len(attempted_endpoints) != 2:
         raise ValueError("Unresolved recap interval: use 'from <ISO timestamp> until <ISO timestamp>' (exclusive end), or --since/--until; date-only, through/to and competing bounds are ambiguous.")
-    if re.search(r'\b(?:inclusive|inclusively|exclusively|including|excluding)\b', query, re.I):
+    endpoint_suffix = query[spans[0].end():]
+    if re.match(r'\s*,?\s*(?:or|and)\s+' + date, endpoint_suffix, re.I):
+        raise ValueError("Competing recap endpoints are unresolved; provide one interval.")
+    # 'Including failures' qualifies recap contents. Inclusion is temporal only
+    # when attached to an endpoint itself, an endpoint noun, or another instant.
+    endpoint_noun = (r'(?:(?:the|both|this|that)\s+)?(?:(?:lower|upper|first|last|initial|final)\s+)?'
+                     r'(?:(?:start|end)(?:ing)?(?:\s+point)?s?|endpoints?|bounds?|boundar(?:y|ies)|dates?|timestamps?|instants?)\b')
+    inclusion = (r'(?:inclusive(?:ly)?\b|exclusively\b|(?:and\s+)?(?:including|excluding)\s+(?:'
+                 + endpoint_noun + '|' + date + ')|' + endpoint_noun
+                 + r'\s+(?:(?:is|are)\s+)?(?:inclusive|exclusive)\b)')
+    if re.match(r'\s*(?:[,;]\s*)?(?:\(\s*)?' + inclusion, endpoint_suffix, re.I):
         raise ValueError("Qualified recap endpoint inclusion is unresolved; use --since (inclusive) and --until (exclusive).")
     endpoints = spans[0].groups()
     if not timezone_declared and any(not re.search(r'(?:Z|[+-]\d{2}:\d{2})$', value, re.I) for value in endpoints):
