@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+import re
 
 
 def evidence_ref(value: Any, *, session: str | None = None) -> dict[str, Any]:
@@ -25,6 +26,9 @@ def evidence_ref(value: Any, *, session: str | None = None) -> dict[str, Any]:
     native = get("native_ref") or get("source_ref")
     if isinstance(native, str) and native:
         ref["native_ref"] = native
+        span = native_byte_locator(native)
+        if span:
+            ref['byte_start'], ref['byte_end'] = span[1:3]
     for key, item in (
         ("session", get("conversation_id") or get("session") or session),
         ("provider", get("provider")),
@@ -38,6 +42,15 @@ def evidence_ref(value: Any, *, session: str | None = None) -> dict[str, Any]:
 def evidence_identity(value: Any) -> tuple[str, str]:
     ref = evidence_ref(value)
     return (ref["path"], str(ref.get("native_ref") or ref["line"]))
+
+
+def native_byte_locator(target):
+    match = re.fullmatch(r'(.+)#bytes=(\d+):(\d+):([a-f0-9]{64})', str(target))
+    if match:
+        path, start, end, digest = match.groups()
+        if int(start) < int(end):
+            return path, int(start), int(end), digest
+    return None
 
 
 def native_locator_path(target: str) -> str | None:

@@ -331,7 +331,7 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
             "source/session/day neighborhood from the same source."
         ),
     )
-    read_more.add_argument("target", help="Exact source target as path:line.")
+    read_more.add_argument("target", help="Exact returned source target: path:line or provider-native locator.")
     add_common_args(read_more)
     read_more.add_argument("--mode", choices=("record", "window", "next", "before", "neighborhood"), default="record")
     read_more.add_argument("--scope", choices=("source", "session", "day"), default="source")
@@ -3215,7 +3215,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         budget = OperationBudget(limit_bytes=min(args.max_bytes, args.hard_cap_bytes) if args.hard_cap_bytes else args.max_bytes, max_elapsed=args.max_elapsed)
         _source_plan, intent, plan = payload_from_args(args)
-        from .history_answer import is_direct_latest_message_history_query, retrieve_chronological_evidence
+        from .history_answer import retrieve_chronological_evidence
+        from .query import is_direct_latest_message_history_query
         default_tz = timezone_from_args(args.timezone, args.timezone_offset)
         operation = retrieve_chronological_evidence if is_direct_latest_message_history_query(args.query) else retrieve_history_evidence
         extra = {'cutoff': parse_now(_source_plan['now'], default_tz), 'requested_cwd': args.cwd,

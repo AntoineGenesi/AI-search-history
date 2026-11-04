@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
 import time
 
 
@@ -84,7 +85,7 @@ class BudgetTextReader:
     def __init__(self, path, budget, phase):
         budget.open_source(path, phase)
         self.handle = Path(path).open("rb")
-        self.size = Path(path).stat().st_size
+        self.size = os.fstat(self.handle.fileno()).st_size
         self.budget, self.phase = budget, phase
 
     def __enter__(self):
@@ -99,7 +100,7 @@ class BudgetTextReader:
             return b""
         if self.budget.remaining_bytes <= 0:
             self.budget.stop("max_bytes")
-        count = min(size, self.budget.remaining_bytes)
+        count = min(size, self.budget.remaining_bytes, self.size - self.handle.tell())
         value = self.handle.readline(count) if line else self.handle.read(count)
         self.budget.charge_text(len(value), self.phase)
         return value
@@ -119,7 +120,7 @@ class BudgetTextReader:
     def __iter__(self):
         return self
 
-    def __next__(self):
+    def readline_bytes(self):
         pieces = []
         while True:
             chunk = self._read(65536, line=True)
@@ -130,7 +131,10 @@ class BudgetTextReader:
             pieces.append(chunk)
             if chunk.endswith(b"\n"):
                 break
-        return b"".join(pieces).decode("utf-8", errors="replace")
+        return b"".join(pieces)
+
+    def __next__(self):
+        return self.readline_bytes().decode("utf-8", errors="replace")
 
 
 def open_source_text(path, *, budget=None, phase="retrieval"):

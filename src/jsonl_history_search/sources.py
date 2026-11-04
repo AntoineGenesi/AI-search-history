@@ -1435,47 +1435,66 @@ def path_is_inside(path: Path, root: Path) -> bool:
 
 
 def enumerate_jsonl_files(plan: SourcePlan, *, preferred_terms: list[str] | None = None, budget=None,
-                          measured_byte_admission: bool = False):
+                          measured_byte_admission: bool = False, priority_identifiers=None):
     started = time.monotonic()
     files_seen = 0
     bytes_seen = 0
     warnings = plan.warnings
-    for root in plan.roots:
-        base = root.path.expanduser()
-        if base.is_file():
-            candidates = [base] if base.suffix.lower() in {".jsonl", ".json", ".md", ".db", ".sqlite", ".sqlite3", ".vscdb"} else []
-        elif base.is_dir():
-            candidates = iter_directory_jsonl_files(
-                base,
-                plan,
-                started,
-                warnings,
-                source_kind=root.kind,
-                preferred_terms=preferred_terms,
-                budget=budget,
-            )
-        else:
-            continue
-        for path in candidates:
-            if budget is not None and not budget.available("enumeration"):
-                warnings.append("Stopped enumeration at operation max elapsed cap.")
-                return warnings
-            if time.monotonic() - started > plan.limits.max_elapsed:
-                warnings.append("Stopped enumeration at max elapsed cap.")
-                return warnings
-            if files_seen >= plan.limits.effective_files():
-                warnings.append("Stopped enumeration at max file cap.")
-                return warnings
-            if not path_is_inside(path, base if base.is_dir() else base.parent):
-                warnings.append(f"Skipped symlink escape: {path}")
+    def candidates_in_scope():
+        for root in plan.roots:
+            base = root.path.expanduser()
+            if base.is_file():
+                candidates = [base] if base.suffix.lower() in {".jsonl", ".json", ".md", ".db", ".sqlite", ".sqlite3", ".vscdb"} else []
+            elif base.is_dir():
+                candidates = iter_directory_jsonl_files(
+                    base,
+                    plan,
+                    started,
+                    warnings,
+                    source_kind=root.kind,
+                    preferred_terms=preferred_terms,
+                    budget=budget,
+                )
+            else:
                 continue
-            size = stat_size(path)
-            if not measured_byte_admission and bytes_seen + size > plan.limits.effective_bytes():
-                warnings.append("Stopped enumeration at max byte cap.")
-                return warnings
-            files_seen += 1
-            bytes_seen += size
-            yield path, size, warnings
+            for path in candidates:
+                if not path_is_inside(path, base if base.is_dir() else base.parent):
+                    warnings.append(f"Skipped symlink escape: {path}")
+                    continue
+                yield path
+
+    candidates = candidates_in_scope()
+    if priority_identifiers is not None:
+        # Filename identity is only an ordering hint. Gather confined metadata
+        # before file admission so an older requester/parent is not starved by
+        # unrelated newer paths. Native owning records still prove identity.
+        pending = list(candidates)
+        def prioritized():
+            while pending:
+                if budget is not None and not budget.available("enumeration"):
+                    return
+                identifiers = [value for value in priority_identifiers() if value]
+                position = next((i for value in identifiers for i, path in enumerate(pending)
+                                 if value in path.name), 0)
+                yield pending.pop(position)
+        candidates = prioritized()
+    for path in candidates:
+        if budget is not None and not budget.available("enumeration"):
+            warnings.append("Stopped enumeration at operation max elapsed cap.")
+            return warnings
+        if time.monotonic() - started > plan.limits.max_elapsed:
+            warnings.append("Stopped enumeration at max elapsed cap.")
+            return warnings
+        if files_seen >= plan.limits.effective_files():
+            warnings.append("Stopped enumeration at max file cap.")
+            return warnings
+        size = stat_size(path)
+        if not measured_byte_admission and bytes_seen + size > plan.limits.effective_bytes():
+            warnings.append("Stopped enumeration at max byte cap.")
+            return warnings
+        files_seen += 1
+        bytes_seen += size
+        yield path, size, warnings
 
 
 def materialize_planned_jsonl_files(

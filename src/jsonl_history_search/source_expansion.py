@@ -19,7 +19,8 @@ from typing import Any
 
 from .adapters import AdapterReadError, iter_records_for_file
 from .agent_contract import source_ref_target
-from .source_refs import evidence_ref, evidence_identity, native_locator_path, ref_target
+from .operation_budget import OperationBudget
+from .source_refs import evidence_ref, evidence_identity, native_locator_path, native_byte_locator, ref_target
 from .sources import PlannedRoot, SourcePlan, path_is_inside, source_kind_for_path
 
 
@@ -954,8 +955,16 @@ def build_source_expansion_payload(
             }
         }
     source_kind = source_kind_for_path(source_path, plan)
+    native_span = native_byte_locator(parsed.native_ref)
+    native_scan, native_budget = None, None
+    if native_span:
+        # Source-plan admission precedes this read. The digest is part of native
+        # identity, so a changed row cannot silently satisfy an old byte ref.
+        native_scan = {'byte_window': native_span[1:3]} if request.mode == 'record' else {'full_source': True}
+        native_budget = OperationBudget(plan.limits.effective_bytes(), plan.limits.max_elapsed)
     try:
-        records = list(iter_records_for_file(source_path, source_kind, default_tz))
+        records = list(iter_records_for_file(source_path, source_kind, default_tz,
+            budget=native_budget, budget_phase='source_expansion', native_scan=native_scan))
     except (AdapterReadError, OSError) as exc:
         return {
             "source_expansion": {
@@ -968,10 +977,16 @@ def build_source_expansion_payload(
             }
         }
 
+    if native_span and request.mode == 'record':
+        base_payload['warnings'].append('Exact native byte record only; surrounding source was not scanned.')
+        base_payload['claim_boundaries']['source_extent_scanned'] = False
     total_records = len(records)
     # Physical lines and normalized record positions diverge when adapters ignore
     # metadata. Resolve identity first; only selection uses compact record order.
-    if parsed.native_ref:
+    if native_span:
+        positions = [index + 1 for index, record in enumerate(records)
+                     if (native_byte_locator(record.source_ref) or (None,))[1:] == native_span[1:]]
+    elif parsed.native_ref:
         positions = [index + 1 for index, record in enumerate(records)
                      if parsed.native_ref == record.source_ref or parsed.native_ref in (record.source_refs or [])]
     else:
@@ -1086,6 +1101,16 @@ def build_source_expansion_payload(
         ],
         "scope": source_scope(plan),
     }
+    if native_span and request.mode == 'record':
+        payload['boundary_flags']['start_of_source_reached'] = native_span[1] == 0
+        payload['boundary_flags']['end_of_source_reached'] = native_span[2] == native_scan.get('snapshot_bytes')
+        payload['total_records_in_source'] = None
+        payload['counts']['before_available'] = None
+        payload['counts']['after_available'] = None
+        payload['source_continuation'] = {'terminal_claim_requires_tail_followup': False,
+            'source_extent_scanned': False}
+        payload['live_tail_caveat'] = {'applies': False,
+            'reason': 'exact byte read does not inspect surrounding source lifecycle'}
     payload["source_positions"] = {"anchor": anchor_position, "start": start_position, "end": end_position,
                                     "meaning": "normalized source record order; not physical lines"}
     payload["continuation"] = {
@@ -1117,6 +1142,10 @@ def build_source_expansion_payload(
             "terminal_claim_requires_tail_followup": True,
             "terminal_session_conclusion": "not_allowed_until_current_tail_is_inspected",
         }
+    if native_span and request.mode == 'record':
+        payload['continuation'] = {'semantics': 'Exact native byte record; surrounding record counts unknown.',
+            'more_before_available': None, 'more_after_available': None, 'next_steps': []}
+        payload['source_positions']['meaning'] = 'position within exact byte read; not source-wide order or physical lines'
     return {"source_expansion": payload}
 
 
@@ -2972,7 +3001,7 @@ def int_or_default(value: Any, default: Any) -> int:
 def parse_expansion_target(target: str | None, source_ref: dict[str, Any] | None = None) -> ParsedTarget:
     if source_ref:
         ref_target = source_ref_target(source_ref)
-        line = _positive_int_or_none(source_ref.get("line"))
+        line = None if native_byte_locator(source_ref.get('native_ref')) else _positive_int_or_none(source_ref.get("line"))
         return ParsedTarget(path_text=str(source_ref.get("path") or "") or None, line=line, raw_target=ref_target, native_ref=source_ref.get("native_ref"))
     if not target:
         return ParsedTarget(path_text=None, line=None, raw_target=None)

@@ -363,7 +363,35 @@ def infer_role(normalized: str) -> str | None:
     return None
 
 
+def is_direct_latest_message_history_query(query):
+    # Classify only; native request identity always receives the original text.
+    text = ' '.join(query.lower().replace('’', "'").split())
+    text = re.sub(r"\b(you|we|what)'ve\b", r'\1 have', text)
+    text = re.sub(r"\bwhat's\b", 'what has', text)
+    recap = re.search(
+        r'\b(?:what(?: the \w+)? (?:(?:has|have) )?(?:happened|changed)\b|'
+        r'what (?:(?:have you|have we) (?:done|been doing)|did (?:you|we) do|has been (?:happening|going on))\b|catch me up\b|'
+        r'summari[sz]e\b|recap\b|(?:give|provide) (?:me )?(?:a |an )?(?:recap|summary|update|progress update)\b|update me\b)', text)
+    if not recap:
+        return False
+    # Conversational framing and a target named before the recap are allowed;
+    # an implementation/causal question about recaps is a different operation.
+    prefix = text[:recap.start()]
+    if re.search(r'\b(?:why|how|implement|debug|fix|test|code|routing|predicate)\b', prefix):
+        return False
+    latest = r'(?:last|latest|most recent|previous)'
+    human = r'(?:(?:genuine(?:ly)?|actual|real|human(?:-authored)?|user)\s+)*'
+    message = r'(?:message|turn|instruction|prompt)'
+    boundary = re.search(
+        r'\b(?:since|after)\s+(?:(?:(?:my|the)\s+)?' + latest + r'\s+' + human + message +
+        r'\b|i (?:last (?:messaged|asked|wrote|spoke|(?:sent|posted) (?:a|my) message)|sent my ' + latest + r' message)\b|'
+        r'(?:the )?last time i (?:messaged|asked|wrote|spoke)\b)|\bwhile i was away\b', text)
+    return bool(boundary)
+
+
 def infer_date_window(normalized: str, now: datetime):
+    if is_direct_latest_message_history_query(normalized):
+        return None, None, None
     today = now.date()
     if "yesterday" in normalized:
         return (*local_day_window(today - timedelta(days=1), now.tzinfo), "yesterday")

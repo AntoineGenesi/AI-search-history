@@ -6,6 +6,7 @@ Rationale: docs/package-map.md#provider-records-and-identity.
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ from .records import Record, parse_record, text_from_item
 from .imported_history import (documentary_report, imported_message, is_documentary_report,
     retained_excerpt, retained_metadata, retained_record, retained_text)
 from .timeutil import parse_datetime
-from .operation_budget import BudgetExceeded, open_source_text, read_source_text
+from .operation_budget import BudgetExceeded, BudgetTextReader, open_source_text, read_source_text
 
 
 class AdapterReadError(OSError):
@@ -71,6 +72,66 @@ class RecordAdapter(Protocol):
         ...
 
 
+def native_jsonl_lines(path, *, budget, phase, scan, stats):
+    """Native snapshot framing; omitted prefixes have byte refs, never fake lines.
+
+    The normalizer below remains the only JSON/message parser. The existing
+    operation allowance bounds a suffix; no second body allowance is granted.
+    """
+    with BudgetTextReader(path, budget, phase) as handle:
+        snapshot = handle.size
+        scan.update(snapshot_bytes=snapshot, prefix_omitted_bytes=0, end_complete=True)
+        window = scan.get('byte_window')
+        if window:
+            start, end = window
+            if not 0 <= start < end <= snapshot:
+                raise AdapterReadError('native byte range outside source snapshot')
+            handle.handle.seek(start)
+            handle.size = end
+            scan['prefix_omitted_bytes'] = start
+        line_number = 0
+        first = True
+        while True:
+            start = handle.handle.tell()
+            try:
+                data = handle.readline_bytes()
+            except StopIteration:
+                break
+            end = handle.handle.tell()
+            line_number += 1
+            if not data.endswith(b'\n'):
+                scan['end_complete'] = False
+                if stats is not None:
+                    stats.note_partial(provider='native', path=path, line=None,
+                        reason='incomplete physical final record omitted at snapshot boundary')
+                break
+            ref = f'{path}#bytes={start}:{end}:{hashlib.sha256(data).hexdigest()}'
+            native_ref = ref if scan['prefix_omitted_bytes'] or window or scan.get('full_source') else None
+            yield (0 if scan['prefix_omitted_bytes'] else line_number), data.decode('utf-8', errors='replace'), native_ref
+            if first and not window and not scan.get('full_source') and snapshot - end > budget.remaining_bytes:
+                # Start inside the bounded suffix. Its first physical fragment
+                # is omitted even if it happens to begin on a record boundary.
+                if not budget.remaining_bytes:
+                    budget.stop('max_bytes')
+                tail_start = max(end, snapshot - budget.remaining_bytes)
+                handle.handle.seek(tail_start)
+                scan['owning_record_byte_end'] = end
+                try:
+                    fragment = handle.readline_bytes()
+                    if not fragment.endswith(b'\n'):
+                        scan['end_complete'] = False
+                        if stats is not None:
+                            stats.note_partial(provider='native', path=path, line=None,
+                                reason='incomplete physical suffix fragment omitted at snapshot boundary')
+                except StopIteration:
+                    pass
+                scan['suffix_byte_start'] = handle.handle.tell()
+                scan['prefix_omitted_bytes'] = handle.handle.tell() - end
+                scan['omitted_byte_range'] = [end, handle.handle.tell()]
+            first = False
+        scan['end_reached'] = handle.handle.tell() == handle.size
+
+
 class JsonlAdapter:
     name = "jsonl"
     line_oriented = True
@@ -89,86 +150,92 @@ class JsonlAdapter:
         raw_line_stats: RawLineScanStats | None = None,
         on_raw_line_examined: Callable[[Path, int], None] | None = None,
         on_raw_line_skipped: Callable[[Path, int], None] | None = None,
-        budget=None, budget_phase="retrieval",
+        budget=None, budget_phase="retrieval", native_scan=None,
     ) -> Iterable[Record]:
-        try:
-            handle = open_source_text(path, budget=budget, phase=budget_phase)
-        except OSError as exc:
-            raise AdapterReadError(f"Could not open {path}: {exc}") from exc
-        with handle:
-            for line_number, line in enumerate(handle, 1):
+        def lines():
+            if native_scan is not None:
+                yield from native_jsonl_lines(path, budget=budget, phase=budget_phase,
+                    scan=native_scan, stats=raw_line_stats)
+            else:
+                with open_source_text(path, budget=budget, phase=budget_phase) as handle:
+                    for number, line in enumerate(handle, 1):
+                        yield number, line, None
+        for line_number, line, native_ref in lines():
+            if raw_line_stats is not None:
+                raw_line_stats.raw_lines_examined += 1
+            if on_raw_line_examined is not None:
+                on_raw_line_examined(path, line_number)
+            if raw_line_filter is not None and not raw_line_filter.should_parse(line):
                 if raw_line_stats is not None:
-                    raw_line_stats.raw_lines_examined += 1
-                if on_raw_line_examined is not None:
-                    on_raw_line_examined(path, line_number)
-                if raw_line_filter is not None and not raw_line_filter.should_parse(line):
-                    if raw_line_stats is not None:
-                        raw_line_stats.raw_lines_skipped_before_full_json_parse += 1
-                    if on_raw_line_skipped is not None:
-                        on_raw_line_skipped(path, line_number)
+                    raw_line_stats.raw_lines_skipped_before_full_json_parse += 1
+                if on_raw_line_skipped is not None:
+                    on_raw_line_skipped(path, line_number)
+                continue
+            if raw_line_stats is not None:
+                raw_line_stats.full_json_records_parsed += 1
+            if source_kind == "arbitrary_jsonl_root":
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, RecursionError):
+                    _note_malformed(raw_line_stats, "imported", path, line_number, "malformed imported JSONL row")
                     continue
-                if raw_line_stats is not None:
-                    raw_line_stats.full_json_records_parsed += 1
-                if source_kind == "arbitrary_jsonl_root":
-                    try:
-                        data = json.loads(line)
-                    except (json.JSONDecodeError, RecursionError):
-                        _note_malformed(raw_line_stats, "imported", path, line_number, "malformed imported JSONL row")
-                        continue
-                    if not isinstance(data, dict):
-                        _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported imported JSONL row")
-                        continue
-                    if is_documentary_report(data):
-                        record = documentary_report(data, path=path, line=line_number)
-                        if record is not None:
-                            yield record
-                        else:
-                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported documentary JSONL object")
-                        continue
-                    if 'record' in data and ('source_ref' in data or 'ref' in data):
-                        record = retained_record(data, path=path, line=line_number, default_tz=default_tz)
-                        if record is not None:
-                            yield record
-                        elif retained_metadata(data):
-                            _note_ignored(raw_line_stats)
-                        else:
-                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported retained-record export")
-                        continue
-                    if 'retained_pre_followup_exchange' in data:
-                        record = retained_text(data, path=path, line=line_number)
-                        if record is not None:
-                            yield record
-                        else:
-                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported retained text")
-                        continue
-                    if isinstance(data.get('record_type'), str) and isinstance(data.get('payload'), dict):
-                        record = imported_message(data, path=path, line=line_number, default_tz=default_tz,
-                            message=data['payload'], locator='#/payload', projected=True)
-                        if record is not None:
-                            yield record
-                        elif (data.get('record_type') in ('session_meta', 'turn_context') or
-                                data['payload'].get('type') in ('session_meta', 'turn_context', 'status')):
-                            _note_ignored(raw_line_stats)
-                        else:
-                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported projected message")
-                        continue
-                    # Keep recognized native transports on their existing parser.
-                    # Metadata objects are never compact-JSON conversation text.
-                    if not (data.get('type') in ('response_item', 'event_msg', 'session_meta',
-                            'turn_context', 'compacted', 'custom', 'summary') or
-                            isinstance(data.get('message'), dict)):
-                        record = imported_message(data, path=path, line=line_number, default_tz=default_tz,
-                            message=data, locator='#', projected=False)
-                        if record is not None:
-                            yield record
-                        else:
-                            _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported imported JSONL object")
-                        continue
-                record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
-                if record.raw is None and raw_line_stats is not None:
-                    _note_malformed(raw_line_stats, "jsonl", path, line_number, "malformed JSONL row")
-                record.source_format = source_kind or self.name
-                yield record
+                if not isinstance(data, dict):
+                    _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported imported JSONL row")
+                    continue
+                if is_documentary_report(data):
+                    record = documentary_report(data, path=path, line=line_number)
+                    if record is not None:
+                        yield record
+                    else:
+                        _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported documentary JSONL object")
+                    continue
+                if 'record' in data and ('source_ref' in data or 'ref' in data):
+                    record = retained_record(data, path=path, line=line_number, default_tz=default_tz)
+                    if record is not None:
+                        yield record
+                    elif retained_metadata(data):
+                        _note_ignored(raw_line_stats)
+                    else:
+                        _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported retained-record export")
+                    continue
+                if 'retained_pre_followup_exchange' in data:
+                    record = retained_text(data, path=path, line=line_number)
+                    if record is not None:
+                        yield record
+                    else:
+                        _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported retained text")
+                    continue
+                if isinstance(data.get('record_type'), str) and isinstance(data.get('payload'), dict):
+                    record = imported_message(data, path=path, line=line_number, default_tz=default_tz,
+                        message=data['payload'], locator='#/payload', projected=True)
+                    if record is not None:
+                        yield record
+                    elif (data.get('record_type') in ('session_meta', 'turn_context') or
+                            data['payload'].get('type') in ('session_meta', 'turn_context', 'status')):
+                        _note_ignored(raw_line_stats)
+                    else:
+                        _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported projected message")
+                    continue
+                # Keep recognized native transports on their existing parser.
+                # Metadata objects are never compact-JSON conversation text.
+                if not (data.get('type') in ('response_item', 'event_msg', 'session_meta',
+                        'turn_context', 'compacted', 'custom', 'summary') or
+                        isinstance(data.get('message'), dict)):
+                    record = imported_message(data, path=path, line=line_number, default_tz=default_tz,
+                        message=data, locator='#', projected=False)
+                    if record is not None:
+                        yield record
+                    else:
+                        _note_skipped(raw_line_stats, "imported", path, line_number, "unsupported imported JSONL object")
+                    continue
+            record = parse_record(line, path=path, line=line_number, default_tz=default_tz)
+            if record.raw is None and raw_line_stats is not None:
+                _note_malformed(raw_line_stats, "jsonl", path, line_number, "malformed JSONL row")
+            record.source_format = source_kind or self.name
+            if native_ref:
+                record.source_ref = native_ref
+                record.source_refs = [native_ref]
+            yield record
 
 
 class GenericMessageArrayJsonAdapter:
@@ -794,9 +861,11 @@ def iter_records_for_file(
     raw_line_stats: RawLineScanStats | None = None,
     on_raw_line_examined: Callable[[Path, int], None] | None = None,
     on_raw_line_skipped: Callable[[Path, int], None] | None = None,
-    budget=None, budget_phase="retrieval",
+    budget=None, budget_phase="retrieval", native_scan=None,
 ) -> Iterable[Record]:
-    records = adapter_for_file(path, source_kind).iter_records(
+    adapter = adapter_for_file(path, source_kind)
+    extra = {"native_scan": native_scan} if isinstance(adapter, JsonlAdapter) else {}
+    records = adapter.iter_records(
         path,
         source_kind=source_kind,
         default_tz=default_tz,
@@ -804,7 +873,7 @@ def iter_records_for_file(
         raw_line_stats=raw_line_stats,
         on_raw_line_examined=on_raw_line_examined,
         on_raw_line_skipped=on_raw_line_skipped,
-        budget=budget, budget_phase=budget_phase,
+        budget=budget, budget_phase=budget_phase, **extra,
     )
     for record in records:
         if budget is not None:
