@@ -625,6 +625,8 @@ def render_history_evidence(payload: dict) -> str:
                     value = original[record['display_text_byte_start']:record['display_text_byte_end']].decode()
                     lines.extend(['', target + ' | ' + record['kind'], value,
                         'Native spans: ' + json.dumps(record['native_spans'])])
+                    if record.get('native_projection'):
+                        lines.append('Native structural projection (full source requires read-more): ' + json.dumps(record['native_projection']))
                     if record.get('invocation_ref'):
                         link = record['invocation_ref']
                         lines.append('Paired invocation: %s:%s%s' % (item['source_ref']['path'], link['line'], ':message.content[%s]' % link['content_index'] if 'content_index' in link else ''))

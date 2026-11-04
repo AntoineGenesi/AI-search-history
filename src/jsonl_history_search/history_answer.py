@@ -20,7 +20,7 @@ from .conversation_records import (ASSISTANT_OR_AGENT_MESSAGE, COMPACTED_HISTORY
     classify_conversation_record)
 from .history_evidence import TEXT_LIMIT, RESPONSE_LIMIT, RETAIN_LIMIT
 from .native_observations import NativeOrigin, native_metadata_identity
-from .records import text_from_item, native_message_payload
+from .records import text_from_item, native_message_payload, native_retention_projection
 from .source_refs import evidence_ref
 from .sources import cap_labels_from_warnings, enumerate_jsonl_files, source_kind_for_path
 
@@ -249,6 +249,15 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
         'timestamp_quality': record.timestamp_quality, 'kind': kind,
         'speaker': 'assistant' if kind == 'reported_claim' else 'tool' if kind.startswith('tool_') else 'unknown' if kind == 'native_record' else 'user',
         'text': clip(text, limit), 'text_complete': original <= limit, 'original_text_bytes': original}
+    projection = native_retention_projection(record.raw or {}, text)
+    if projection:
+        projected_text = projection.pop('text')
+        projection['preview_complete'] = len(projected_text.encode()) <= limit
+        fields = {'text': clip(projected_text, limit), 'text_complete': False, 'native_projection': projection}
+        # A compact telemetry envelope must pay for its own disclosure fields.
+        # Opaque content is never represented as readable reasoning.
+        if projection['omitted_fields'] or len(encoded(fields)) < len(encoded({key: result[key] for key in ('text', 'text_complete')})):
+            result.update(fields)
     body = native_message_payload(record.raw or {})
     for source, target in (('channel', 'native_channel'), ('sender', 'native_origin'), ('name', 'tool_name')):
         if isinstance(body, dict) and isinstance(body.get(source), str):
@@ -603,8 +612,14 @@ def report_ref(ref):
 
 
 def report_text(entry, allowance):
-    """Literal retained prefix plus nonoverlapping supplemental native spans."""
+    """Keep literal spans distinct from explicitly labeled native projections."""
     prefix = clip(entry.get('text', ''), allowance)
+    if entry.get('native_projection'):
+        original = entry['original_text_bytes']
+        complete = entry['native_projection']['preview_complete'] and prefix == entry['text']
+        body = ('Structural projection (not literal source-text offsets; full source requires read-more; '
+                'projection preview complete: %s):\n%s' % (complete, prefix))
+        return body, [(0, original)] if original else [], original
     spans = [(0, prefix)] if prefix else []
     remaining = allowance - len(prefix.encode())
     end = len(prefix.encode())
@@ -663,7 +678,7 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
         'Invocation preview limited to already-complete text <=256 bytes. Invocation arguments omitted: clipped or longer; refs do not prove unseen arguments.\n'
         'Projection: every retained assistant report, returned result, interval human message and unstructured native record, with paired/unresolved invocation refs. Disposition spans supplement literal prefixes. Child activity not established complete.\n'
         'Readback: use read-more <Source>:<line> --mode record for L<line>, or read-more <Source>#<bytes locator> --mode record for bytes=...; content indices identify the part within that native record. Reuse the admitted root.\n'
-        'Text byte offsets describe the retained normalized/masked text; original byte size and omitted gaps do not imply unseen content. Projection coverage does not imply complete returned text.\n\n') % (
+        'Text byte offsets describe the retained normalized/masked text; structural auxiliary projections are labeled separately and have no literal source-text offsets. Original byte size and omitted gaps do not imply unseen content. Projection coverage does not imply complete returned text.\n\n') % (
             source_path or anchor['source_ref']['path'], scope, scope == 'proven_parent', report_ref(anchor['source_ref']) if anchor else 'none (supplied record-time interval)',
             anchor['text'] if anchor else 'No human anchor inferred from timestamps.', cutoff.isoformat(), source_complete, temporal_complete,
             json.dumps(omissions, separators=(',', ':')), bool(masked))
@@ -688,6 +703,8 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
             for field in ('authorship', 'native_channel', 'native_origin', 'tool_name'):
                 if entry.get(field):
                     fields.append('%s=%s' % (field, entry[field]))
+            if entry.get('native_projection'):
+                fields.append('native projection=' + json.dumps(entry['native_projection'], separators=(',', ':')))
             if kind == 'tool_result':
                 fields.append('invocation ' + report_ref(entry['invocation_ref']) if entry.get('invocation_ref') else 'association unavailable')
             if entry.get('native_mirror_lines'):
@@ -719,6 +736,8 @@ def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_compl
             entry = selected[ref]
             route = [report_ref(entry['source_ref']), kind,
                 'original text bytes=%s' % entry.get('original_text_bytes', 'unknown')]
+            if entry.get('native_projection'):
+                route.append('native projection=' + json.dumps(entry['native_projection'], separators=(',', ':')))
             if kind == 'tool_result':
                 route.append('invocation=' + report_ref(entry['invocation_ref']) if entry.get('invocation_ref') else 'association unavailable')
             elif ref in unresolved:
@@ -850,6 +869,7 @@ def display_entries(entries, allowance, contexts, path):
             if text:
                 pieces.append({'source_ref': item['source_ref'], 'timestamp': item['timestamp'],
                     'kind': item['kind'], 'text': text, 'spans': spans,
+                    **({'native_projection': item['native_projection']} if 'native_projection' in item else {}),
                     **({'authorship': item['authorship']} if 'authorship' in item else {}),
                     'text_complete': item['text_complete'] and text == item['text'],
                     **({'invocation_ref': item['invocation_ref']} if 'invocation_ref' in item else {})})
@@ -860,6 +880,7 @@ def display_entries(entries, allowance, contexts, path):
             text = clip(item['text'], max(0, per_group - 1))
             if text:
                 pieces = [{'source_ref': item['source_ref'], 'timestamp': item['timestamp'], 'kind': item['kind'],
+                    **({'native_projection': {**item['native_projection'], 'preview_complete': False}} if 'native_projection' in item else {}),
                     **({'authorship': item['authorship']} if 'authorship' in item else {}),
                     'text': text, 'spans': [{'text_byte_start': 0, 'text_byte_end': len(text.encode()), 'text': text}],
                     'text_complete': False, **({'invocation_ref': item['invocation_ref']} if 'invocation_ref' in item else {})}]
@@ -871,7 +892,8 @@ def display_entries(entries, allowance, contexts, path):
                 references.append({**piece['source_ref'], 'kind': piece['kind'],
                     **({'authorship': piece['authorship']} if 'authorship' in piece else {}),
                     'display_text_byte_start': start, 'display_text_byte_end': len(text.encode()) - 1,
-                    'native_spans': [{k: v for k, v in s.items() if k != 'text'} for s in piece['spans']],
+                    'native_spans': [] if piece.get('native_projection') else [{k: v for k, v in s.items() if k != 'text'} for s in piece['spans']],
+                    **({'native_projection': piece['native_projection']} if 'native_projection' in piece else {}),
                     'text_complete': piece['text_complete'], 'invocation_ref': piece.get('invocation_ref')})
             selected.append({'kind': 'chronological_context', 'source_ref': {'path': path, **pieces[0]['source_ref']},
                 'timestamp': pieces[0]['timestamp'], 'text': text, 'records': references, 'native_record_count': len(group)})
@@ -991,6 +1013,9 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     omissions = {'native_control_records': sum(s.controls for s in states), 'native_event_mirrors': sum(s.mirrors for s in states),
         'after_cutoff_records': sum(s.future for s in states), 'retention_records': sum(s.retention_omitted for s in states),
         'clipped_retained_records': sum(s.clipped for s in states), 'pending_association_cap': sum(s.call_omitted for s in states)}
+    omissions.update({'structurally_projected_retained_records': sum('native_projection' in entry for s in states for entry in s.entries),
+        'opaque_payload_retained_records': sum(bool(entry.get('native_projection', {}).get('omitted_fields')) for s in states for entry in s.entries),
+        'projected_original_text_bytes': sum(entry['original_text_bytes'] for s in states for entry in s.entries if 'native_projection' in entry)})
     artifact = None
     if chosen:
         try:

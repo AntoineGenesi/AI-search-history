@@ -80,6 +80,46 @@ def native_message_payload(raw):
     return payload
 
 
+def native_retention_projection(raw, text):
+    """Known auxiliary transports, separate from conversation/evidence roles.
+
+    The original record remains authoritative for identity and readback. Keep
+    unknown fields (including status/errors), plaintext and numeric observations;
+    only an explicitly encrypted field has no readable evidence to retain.
+    """
+    body = native_message_payload(raw)
+    if not isinstance(body, dict):
+        return None
+    if raw.get('type') == 'event_msg' and body.get('type') == 'token_count':
+        kind, omitted = 'token_usage_observation', []
+    elif (raw.get('type') == 'response_item' and body.get('type') == 'reasoning'
+            and isinstance(body.get('encrypted_content'), str) and body['encrypted_content']):
+        kind, omitted = 'reasoning_with_opaque_payload', ['encrypted_content']
+    else:
+        return None
+    # Span masking belongs to original normalized text coordinates. Project
+    # only that already-masked value; never remask reordered fields or rebuild
+    # hidden plaintext from raw. A non-JSON masked view keeps its normal excerpt.
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict) or value.get('type') != body.get('type'):
+        return None
+    if not omitted:
+        # Unknown status/error fields must not follow a verbose usage envelope.
+        keys = ('info', 'rate_limits')
+        projection = {key: item for key, item in value.items() if key not in keys}
+        projection.update((key, value[key]) for key in keys if key in value)
+    else:
+        # Plaintext summaries precede envelope metadata in the bounded preview.
+        projection = {key: value[key] for key in ('summary', 'content') if key in value}
+        projection.update((key, item) for key, item in value.items()
+                          if key not in {'summary', 'content', 'encrypted_content'})
+    return {'kind': kind, 'omitted_fields': omitted,
+            'text': json.dumps(projection, ensure_ascii=False, separators=(',', ':'))}
+
+
 def parse_record(raw: str, *, path: Path, line: int, default_tz) -> Record:
     try:
         data = json.loads(raw)
