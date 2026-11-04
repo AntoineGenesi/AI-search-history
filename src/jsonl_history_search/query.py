@@ -382,8 +382,11 @@ def is_direct_latest_message_history_query(query):
     latest = r'(?:last|latest|most recent|previous)'
     human = r'(?:(?:genuine(?:ly)?|actual|real|human(?:-authored)?|user)\s+)*'
     message = r'(?:message|turn|instruction|prompt)'
+    target = (r'(?:(?:the|this|that|my|your|our|its|their)\s+)?'
+              r'(?:(?:parent|main|current)\s+)?(?:thread|session|conversation|chat)')
+    owner = r'(?:(?:my|the|its|their|your|our)\s+|' + target + r"'s\s+)?"
     boundary = re.search(
-        r'\b(?:since|after)\s+(?:(?:(?:my|the)\s+)?' + latest + r'\s+' + human + message +
+        r'\b(?:since|after)\s+(?:' + owner + latest + r'\s+' + human + message +
         r'\b|i (?:last (?:messaged|asked|wrote|spoke|(?:sent|posted) (?:a|my) message)|sent my ' + latest + r' message)\b|'
         r'(?:the )?last time i (?:messaged|asked|wrote|spoke)\b)|\bwhile i was away\b', text)
     return bool(boundary)
