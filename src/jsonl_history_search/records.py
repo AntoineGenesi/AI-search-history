@@ -84,8 +84,8 @@ def native_retention_projection(raw, text):
     """Known auxiliary transports, separate from conversation/evidence roles.
 
     The original record remains authoritative for identity and readback. Keep
-    unknown fields (including status/errors), plaintext and numeric observations;
-    only an explicitly encrypted field has no readable evidence to retain.
+    unknown fields (including status/errors) and plaintext. Routine numeric usage
+    stays recoverable from the same native ref, separately from protected quotas.
     """
     body = native_message_payload(raw)
     if not isinstance(body, dict):
@@ -113,24 +113,34 @@ def native_retention_projection(raw, text):
         projection.update((key, value[key]) for key in keys if key in value)
         usage = body.get('info')
         counters = {'input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'}
-        auxiliary = (set(body) <= {'type', 'info', 'rate_limits'}
-                     and (body.get('rate_limits') is None or body.get('rate_limits') == {})
-                     and (usage is None or isinstance(usage, dict)))
+        routine_usage = usage is None or isinstance(usage, dict)
         if isinstance(usage, dict):
-            auxiliary = auxiliary and set(usage) <= {'total_token_usage', 'last_token_usage', 'model_context_window'}
+            routine_usage = set(usage) <= {'total_token_usage', 'last_token_usage', 'model_context_window'}
             for key, item in usage.items():
                 if key in {'total_token_usage', 'last_token_usage'}:
-                    auxiliary = auxiliary and (item is None or (isinstance(item, dict)
+                    routine_usage = routine_usage and (item is None or (isinstance(item, dict)
                         and set(item) <= counters and all(type(number) in {int, float} or number is None for number in item.values())))
                 else:
-                    auxiliary = auxiliary and (type(item) in {int, float} or item is None)
+                    routine_usage = routine_usage and (type(item) in {int, float} or item is None)
+            if routine_usage:
+                # Quotas/status keep their exact fields. The routine observation
+                # is available by native record readback, never an invented sum.
+                projection.pop('info', None)
+                omitted.append('info')
+        auxiliary = (routine_usage and set(body) <= {'type', 'info', 'rate_limits'}
+                     and (body.get('rate_limits') is None or body.get('rate_limits') == {}))
     else:
         # Plaintext summaries precede envelope metadata in the bounded preview.
         projection = {key: value[key] for key in ('summary', 'content') if key in value}
         projection.update((key, item) for key, item in value.items()
                           if key not in {'summary', 'content', 'encrypted_content'})
-        auxiliary = (set(body) <= {'type', 'id', 'summary', 'content', 'encrypted_content'}
+        provenance = body.get('internal_chat_message_metadata_passthrough')
+        known_provenance = (provenance is None or (isinstance(provenance, dict)
+            and set(provenance) == {'turn_id'} and isinstance(provenance['turn_id'], str)))
+        auxiliary = (set(body) <= {'type', 'id', 'summary', 'content', 'encrypted_content',
+                                  'turn_id', 'internal_chat_message_metadata_passthrough'}
                      and (body.get('id') is None or isinstance(body['id'], str))
+                     and (body.get('turn_id') is None or isinstance(body['turn_id'], str)) and known_provenance
                      and (body.get('summary') is None or body.get('summary') == [])
                      and (body.get('content') is None or body.get('content') == []))
     return {'kind': kind, 'omitted_fields': omitted, 'auxiliary': auxiliary,

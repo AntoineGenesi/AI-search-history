@@ -63,7 +63,8 @@ class NativeSession:
     auxiliary_evicted: int = 0
     clipped: int = 0
     pending: dict = field(default_factory=dict)
-    call_omitted: int = 0
+    pending_overflow: int = 0
+    invocation_admission_omitted: int = 0
     open_turn: str | None = None
     open_turn_ref: dict | None = None
     turn_conflict: bool = False
@@ -219,7 +220,7 @@ def resolve_request_boundary(state, request_turn, live_request, boundary):
                 if call not in state.pending and len(state.pending) < 128:
                     state.pending[call] = value
                 elif call not in state.pending:
-                    state.call_omitted += 1
+                    state.pending_overflow += 1
             state.auxiliary_closed = state.auxiliary_closed or prior['auxiliary_closed']
             for field in ('after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped', 'auxiliary_omitted', 'auxiliary_evicted'):
                 setattr(state, field, getattr(state, field) + prior[field])
@@ -332,11 +333,15 @@ def admit(state, entry, limit):
     auxiliary = entry.get('auxiliary', False)
     if state.retained_cost + cost > limit and not auxiliary:
         evict_auxiliary(state)
+    if state.retained_cost + cost > limit and entry['kind'] == 'tool_invocation' and entry['text']:
+        # Prefer the native invocation identity/association to a short preview.
+        entry.update(text='', text_complete=False)
+        cost = len(encoded(entry)) + 1
     if (auxiliary and state.auxiliary_closed) or state.retained_cost + cost > limit:
         state.retention_omitted += 1
         state.auxiliary_omitted += auxiliary
         if entry['kind'] == 'tool_invocation' and entry.get('call_id'):
-            state.call_omitted += 1
+            state.invocation_admission_omitted += 1
         return
     state.entries.append(entry)
     state.retained_cost += cost
@@ -347,7 +352,7 @@ def admit(state, entry, limit):
             # uncharged copy of their native refs/arguments.
             state.pending[entry['call_id']] = entry
         else:
-            state.call_omitted += 1
+            state.pending_overflow += 1
 
 
 def begin_human_interval(state, record, *, body, timestamp, origin, uncertain_tail,
@@ -1055,13 +1060,15 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     entries = chosen.entries if chosen else [s.anchor for s in candidates if s.anchor][:max(0, min(30, plan.limits.max_matches))]
     omissions = {'native_control_records': sum(s.controls for s in states), 'native_event_mirrors': sum(s.mirrors for s in states),
         'after_cutoff_records': sum(s.future for s in states), 'retention_records': sum(s.retention_omitted for s in states),
-        'clipped_retained_records': sum(s.clipped for s in states), 'pending_association_cap': sum(s.call_omitted for s in states)}
+        'clipped_retained_records': sum(s.clipped for s in states), 'pending_association_cap': sum(s.pending_overflow for s in states)}
     omissions.update({'auxiliary_retention_omitted_records': sum(s.auxiliary_omitted for s in states),
         'auxiliary_evicted_records': sum(s.auxiliary_evicted for s in states),
-        'unrenderable_invocation_previews_omitted_records': sum(entry['kind'] == 'tool_invocation' and not entry['text']
+        'invocation_admission_omitted_records': sum(s.invocation_admission_omitted for s in states),
+        'invocation_previews_omitted_records': sum(entry['kind'] == 'tool_invocation' and not entry['text']
             and entry['original_text_bytes'] > 0 for s in states for entry in s.entries)})
     omissions.update({'structurally_projected_retained_records': sum('native_projection' in entry for s in states for entry in s.entries),
-        'opaque_payload_retained_records': sum(bool(entry.get('native_projection', {}).get('omitted_fields')) for s in states for entry in s.entries),
+        'opaque_payload_retained_records': sum(entry.get('native_projection', {}).get('kind') == 'reasoning_with_opaque_payload' for s in states for entry in s.entries),
+        'usage_observation_readback_records': sum('info' in entry.get('native_projection', {}).get('omitted_fields', []) for s in states for entry in s.entries),
         'projected_original_text_bytes': sum(entry['original_text_bytes'] for s in states for entry in s.entries if 'native_projection' in entry)})
     artifact = None
     if chosen:
