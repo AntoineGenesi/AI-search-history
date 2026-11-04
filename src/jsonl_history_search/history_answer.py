@@ -866,9 +866,6 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         scope = selected_scope if chosen else 'ambiguous_sessions' if candidates else 'unavailable_session'
         if diagnostic:
             errors.append({'reason': diagnostic})
-    elif explicit_roots and (parent_requested or main_requested):
-        scope = 'unverified_parent' if parent_requested else 'unverified_main'
-        errors.append({'reason': 'requesting native ownership unavailable; selected-source evidence does not verify the requested relationship'})
     elif not explicit_roots:
         chosen = states[0] if target and states and states[0].anchor else None
         scope = target_scope if chosen else 'ambiguous_sessions' if candidates else 'unavailable_session'
