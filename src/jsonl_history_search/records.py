@@ -111,12 +111,29 @@ def native_retention_projection(raw, text):
         keys = ('info', 'rate_limits')
         projection = {key: item for key, item in value.items() if key not in keys}
         projection.update((key, value[key]) for key in keys if key in value)
+        usage = body.get('info')
+        counters = {'input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'}
+        auxiliary = (set(body) <= {'type', 'info', 'rate_limits'}
+                     and (body.get('rate_limits') is None or body.get('rate_limits') == {})
+                     and (usage is None or isinstance(usage, dict)))
+        if isinstance(usage, dict):
+            auxiliary = auxiliary and set(usage) <= {'total_token_usage', 'last_token_usage', 'model_context_window'}
+            for key, item in usage.items():
+                if key in {'total_token_usage', 'last_token_usage'}:
+                    auxiliary = auxiliary and (item is None or (isinstance(item, dict)
+                        and set(item) <= counters and all(type(number) in {int, float} or number is None for number in item.values())))
+                else:
+                    auxiliary = auxiliary and (type(item) in {int, float} or item is None)
     else:
         # Plaintext summaries precede envelope metadata in the bounded preview.
         projection = {key: value[key] for key in ('summary', 'content') if key in value}
         projection.update((key, item) for key, item in value.items()
                           if key not in {'summary', 'content', 'encrypted_content'})
-    return {'kind': kind, 'omitted_fields': omitted,
+        auxiliary = (set(body) <= {'type', 'id', 'summary', 'content', 'encrypted_content'}
+                     and (body.get('id') is None or isinstance(body['id'], str))
+                     and (body.get('summary') is None or body.get('summary') == [])
+                     and (body.get('content') is None or body.get('content') == []))
+    return {'kind': kind, 'omitted_fields': omitted, 'auxiliary': auxiliary,
             'text': json.dumps(projection, ensure_ascii=False, separators=(',', ':'))}
 
 

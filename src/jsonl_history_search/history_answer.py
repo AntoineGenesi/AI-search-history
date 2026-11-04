@@ -58,6 +58,9 @@ class NativeSession:
     entries: list = field(default_factory=list)
     retained_cost: int = 0
     retention_omitted: int = 0
+    auxiliary_closed: bool = False
+    auxiliary_omitted: int = 0
+    auxiliary_evicted: int = 0
     clipped: int = 0
     pending: dict = field(default_factory=dict)
     call_omitted: int = 0
@@ -161,7 +164,8 @@ def resolve_native_target(sessions, request_session, *, parent_requested, main_r
 
 
 INTERVAL_FIELDS = ('anchor', 'anchor_time', 'entries', 'pending', 'retained_cost',
-                   'after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped')
+                   'after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped',
+                   'auxiliary_closed', 'auxiliary_omitted', 'auxiliary_evicted')
 
 
 def resolve_request_boundary(state, request_turn, live_request, boundary):
@@ -216,7 +220,8 @@ def resolve_request_boundary(state, request_turn, live_request, boundary):
                     state.pending[call] = value
                 elif call not in state.pending:
                     state.call_omitted += 1
-            for field in ('after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped'):
+            state.auxiliary_closed = state.auxiliary_closed or prior['auxiliary_closed']
+            for field in ('after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped', 'auxiliary_omitted', 'auxiliary_evicted'):
                 setattr(state, field, getattr(state, field) + prior[field])
     state.previous_interval = None
 
@@ -251,6 +256,8 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
         'text': clip(text, limit), 'text_complete': original <= limit, 'original_text_bytes': original}
     projection = native_retention_projection(record.raw or {}, text)
     if projection:
+        if projection.pop('auxiliary'):
+            result['auxiliary'] = True
         projected_text = projection.pop('text')
         projection['preview_complete'] = len(projected_text.encode()) <= limit
         fields = {'text': clip(projected_text, limit), 'text_complete': False, 'native_projection': projection}
@@ -258,6 +265,8 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
         # Opaque content is never represented as readable reasoning.
         if projection['omitted_fields'] or len(encoded(fields)) < len(encoded({key: result[key] for key in ('text', 'text_complete')})):
             result.update(fields)
+    if kind == 'tool_invocation' and original > min(256, limit):
+        result.update(text='', text_complete=False)
     body = native_message_payload(record.raw or {})
     for source, target in (('channel', 'native_channel'), ('sender', 'native_origin'), ('name', 'tool_name')):
         if isinstance(body, dict) and isinstance(body.get(source), str):
@@ -278,6 +287,33 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
     return result
 
 
+def evict_auxiliary(state):
+    """Reclaim optional payload once; no omitted-record ledger or refill loop."""
+    current, prior = vars(state), state.previous_interval
+    for interval in [current] + ([prior] if prior else []):
+        if interval['auxiliary_closed']:
+            continue
+        kept, freed, clipped, removed = [], 0, 0, 0
+        for entry in interval['entries']:
+            if entry.get('auxiliary'):
+                freed += len(encoded(entry)) + 1
+                clipped += not entry['text_complete']
+                removed += 1
+            else:
+                kept.append(entry)
+        interval['entries'] = kept
+        interval['retained_cost'] -= freed
+        interval['clipped'] -= clipped
+        interval['retention_omitted'] += removed
+        interval['auxiliary_omitted'] += removed
+        interval['auxiliary_evicted'] += removed
+        interval['auxiliary_closed'] = True
+        if interval is prior and not prior.get('shared_entries'):
+            # A pending latest-human boundary holds disjoint prior/current
+            # entries against one allowance. Supplied snapshots share a prefix.
+            state.retained_cost -= freed
+
+
 def admit(state, entry, limit):
     # All interval records bind to this session's single physical source. Store
     # that identity once in the artifact header rather than thousands of times.
@@ -293,12 +329,25 @@ def admit(state, entry, limit):
                 keys.update({'native_ref', 'byte_start', 'byte_end'})
             entry[field] = {k: v for k, v in ref.items() if k in keys}
     cost = len(encoded(entry)) + 1
-    if state.retained_cost + cost > limit:
+    auxiliary = entry.get('auxiliary', False)
+    if state.retained_cost + cost > limit and not auxiliary:
+        evict_auxiliary(state)
+    if (auxiliary and state.auxiliary_closed) or state.retained_cost + cost > limit:
         state.retention_omitted += 1
+        state.auxiliary_omitted += auxiliary
+        if entry['kind'] == 'tool_invocation' and entry.get('call_id'):
+            state.call_omitted += 1
         return
     state.entries.append(entry)
     state.retained_cost += cost
     state.clipped += not entry['text_complete']
+    if entry['kind'] == 'tool_invocation' and entry.get('call_id'):
+        if len(state.pending) < 128:
+            # Pending associations reference admitted entries, never a second
+            # uncharged copy of their native refs/arguments.
+            state.pending[entry['call_id']] = entry
+        else:
+            state.call_omitted += 1
 
 
 def begin_human_interval(state, record, *, body, timestamp, origin, uncertain_tail,
@@ -333,6 +382,8 @@ def begin_human_interval(state, record, *, body, timestamp, origin, uncertain_ta
     if not state.previous_interval:
         state.retained_cost = 0
     state.after_anchor = state.interval_raw_records = state.retention_omitted = state.clipped = 0
+    state.auxiliary_closed = False
+    state.auxiliary_omitted = state.auxiliary_evicted = 0
 
 
 def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context,
@@ -491,12 +542,7 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                     raw_call = str((item.get('id') if invocation else item.get('tool_use_id')) or '')
                     call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
                     entry['call_id'] = call or None
-                    if invocation and call:
-                        if len(state.pending) < 128:
-                            state.pending[call] = {'source_ref': entry['source_ref'], 'call_id': call}
-                        else:
-                            state.call_omitted += 1
-                    elif not invocation:
+                    if not invocation:
                         matched = state.pending.pop(call, None) if call else None
                         entry['invocation_ref'] = matched['source_ref'] if matched else None
                         entry['native_is_error'] = item.get('is_error')
@@ -552,6 +598,7 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                     or (request_turn and native_turn == request_turn))
                 if candidate:
                     state.previous_interval = {name: getattr(state, name) for name in INTERVAL_FIELDS}
+                    state.previous_interval['shared_entries'] = True
                     state.previous_interval['interval_raw_records'] = max(0, state.interval_raw_records - 1)
                     state.entries, state.pending = list(state.entries), dict(state.pending)
                     state.request_candidate = {'anchor': {**entry, 'source_ref': dict(entry['source_ref'])}, 'turn': native_turn,
@@ -579,10 +626,6 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
             if call:
                 entry['call_id'] = clip(call, 256)
-                if len(state.pending) < 128:
-                    state.pending[call] = {'source_ref': entry['source_ref'], 'call_id': entry['call_id']}
-                else:
-                    state.call_omitted += 1
             admit(state, entry, retained_limit)
         elif event in {'function_call_output', 'custom_tool_call_output', 'tool_result', 'tool_output'}:
             entry = excerpt(record, kind='tool_result', mask_context=mask_context,
@@ -1013,6 +1056,10 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     omissions = {'native_control_records': sum(s.controls for s in states), 'native_event_mirrors': sum(s.mirrors for s in states),
         'after_cutoff_records': sum(s.future for s in states), 'retention_records': sum(s.retention_omitted for s in states),
         'clipped_retained_records': sum(s.clipped for s in states), 'pending_association_cap': sum(s.call_omitted for s in states)}
+    omissions.update({'auxiliary_retention_omitted_records': sum(s.auxiliary_omitted for s in states),
+        'auxiliary_evicted_records': sum(s.auxiliary_evicted for s in states),
+        'unrenderable_invocation_previews_omitted_records': sum(entry['kind'] == 'tool_invocation' and not entry['text']
+            and entry['original_text_bytes'] > 0 for s in states for entry in s.entries)})
     omissions.update({'structurally_projected_retained_records': sum('native_projection' in entry for s in states for entry in s.entries),
         'opaque_payload_retained_records': sum(bool(entry.get('native_projection', {}).get('omitted_fields')) for s in states for entry in s.entries),
         'projected_original_text_bytes': sum(entry['original_text_bytes'] for s in states for entry in s.entries if 'native_projection' in entry)})
