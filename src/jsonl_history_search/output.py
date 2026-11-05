@@ -610,9 +610,8 @@ def render_history_evidence(payload: dict) -> str:
                 lines.append('Record-time bounds: lower %s (%s); upper %s (%s).' % (
                     boundary['start'], 'inclusive' if boundary['start_inclusive'] else 'exclusive',
                     boundary['end'], 'inclusive' if boundary['end_inclusive'] else 'exclusive'))
-                if boundary.get('unverified_event_description'):
-                    lines.append('Unverified event description: %s. These record-time bounds do not verify the event, its author or its relation to the stated instant.'
-                        % boundary['unverified_event_description'])
+                if boundary.get('named_event'):
+                    lines.append('The named event description in the original question is unverified. These record-time bounds do not verify the event, its author or its relation to the stated instant.')
         anchor = chronology.get('anchor')
         if anchor:
             label = 'Human boundary candidate' if (chronology.get('request_boundary') or {}).get('status') == 'uncertain' else 'Human boundary'
