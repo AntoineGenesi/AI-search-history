@@ -21,6 +21,7 @@ from .conversation_records import (ASSISTANT_OR_AGENT_MESSAGE, COMPACTED_HISTORY
 from .history_evidence import TEXT_LIMIT, RESPONSE_LIMIT, RETAIN_LIMIT
 from .native_observations import NativeOrigin, native_metadata_identity
 from .records import text_from_item, native_message_payload, native_retention_projection
+from .query import RecordTimeInterval
 from .source_refs import evidence_ref
 from .sources import cap_labels_from_warnings, enumerate_jsonl_files, source_kind_for_path
 
@@ -86,28 +87,27 @@ class NativeTargetIntegrityError(ValueError):
 @dataclass(frozen=True)
 class ChronologyBoundary:
     """Boundary policy is independent of native ownership and acquisition."""
-    start: object = None
-    end: object = None
+    interval: RecordTimeInterval | None = None
     origin: str = 'latest_native_human'
 
     @property
     def supplied(self):
-        return self.start is not None and self.end is not None
+        return self.interval is not None
 
     def active(self, state):
         return self.supplied or state.anchor is not None
 
     def eligible(self, timestamp):
-        return not self.supplied or (timestamp is not None and self.start <= timestamp < self.end)
+        return not self.supplied or self.interval.contains(timestamp)
 
     def selectable(self, state):
         return bool(state.session and (self.supplied or state.anchor) and not state.worker)
 
     def to_dict(self):
-        return {'type': 'record_time_interval' if self.supplied else 'latest_native_human',
-                'origin': self.origin, 'since_inclusive': self.start.isoformat() if self.supplied else None,
-                'until_exclusive': self.end.isoformat() if self.supplied else None,
-                'human_anchor_required': not self.supplied}
+        if self.supplied:
+            return {**self.interval.to_dict(), 'origin': self.origin}
+        return {'type': 'latest_native_human', 'origin': self.origin,
+                'since_inclusive': None, 'until_exclusive': None, 'human_anchor_required': True}
 
 
 def discover_native_sessions(files, *, plan, budget, default_tz, on_metadata=None):
@@ -961,7 +961,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
                                   cutoff, requested_cwd=None, mask_context=None, output_format='json', live_request=False,
                                   explicit_roots=True):
     cutoff = cutoff.astimezone(timezone.utc)
-    boundary = (ChronologyBoundary(intent.date_window_start, intent.date_window_end, intent.interval_origin)
+    boundary = (ChronologyBoundary(intent.record_time_interval, intent.interval_origin)
                 if intent.chronology_mode == 'supplied_interval' else ChronologyBoundary())
     states, stats = [], RawLineScanStats()
     request_session = os.environ.get('CODEX_THREAD_ID')
@@ -1055,7 +1055,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
         source_complete = False
     temporal = bool(chosen and chosen.temporal_complete)
     complete = source_complete and temporal and chosen is not None and chosen.boundary_complete
-    cutoff_truncated = bool(boundary.supplied and cutoff < boundary.end)
+    cutoff_truncated = bool(boundary.supplied and cutoff < boundary.interval.end)
     complete = complete and not cutoff_truncated
     boundary_metadata = {**boundary.to_dict(), 'cutoff_truncated': cutoff_truncated,
         'native_boundary_complete': bool(chosen and chosen.boundary_complete),

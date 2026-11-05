@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .expansion import SEMANTIC_LOCAL, expand_query_terms, task_slug_variants
 from .timeutil import local_day_window, parse_datetime
@@ -138,6 +138,38 @@ class QueryPlan:
         }
 
 
+@dataclass(frozen=True)
+class RecordTimeInterval:
+    """Exact caller bounds; event wording supplies no native identity proof."""
+    start: datetime
+    end: datetime
+    start_inclusive: bool = True
+    end_inclusive: bool = False
+    event_description: str | None = None
+
+    def __post_init__(self):
+        if self.start.utcoffset() is None or self.end.utcoffset() is None:
+            raise ValueError("Recap interval bounds need an explicit timezone.")
+        object.__setattr__(self, 'start', self.start.astimezone(timezone.utc))
+        object.__setattr__(self, 'end', self.end.astimezone(timezone.utc))
+        if self.end <= self.start:
+            raise ValueError("Recap interval end must be later than its start.")
+
+    def contains(self, timestamp):
+        return timestamp is not None and (
+            timestamp > self.start or self.start_inclusive and timestamp == self.start
+        ) and (timestamp < self.end or self.end_inclusive and timestamp == self.end)
+
+    def to_dict(self):
+        result = {'type': 'record_time_interval', 'start': self.start.isoformat(),
+                  'end': self.end.isoformat(), 'start_inclusive': self.start_inclusive,
+                  'end_inclusive': self.end_inclusive, 'human_anchor_required': False,
+                  'event_identity_verified': False}
+        if self.event_description:
+            result['unverified_event_description'] = self.event_description
+        return result
+
+
 @dataclass
 class QueryIntent:
     original: str
@@ -157,6 +189,7 @@ class QueryIntent:
     query_plan: QueryPlan | None = None
     chronology_mode: str | None = None
     interval_origin: str | None = None
+    record_time_interval: RecordTimeInterval | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -173,6 +206,9 @@ class QueryIntent:
                 "end": self.date_window_end.isoformat() if self.date_window_end else None,
                 "reason": self.date_reason,
                 "filter": self.date_window_filter,
+                **({'start_inclusive': self.record_time_interval.start_inclusive,
+                    'end_inclusive': self.record_time_interval.end_inclusive}
+                   if self.record_time_interval else {}),
             },
             "artifact_hints": self.artifact_hints,
             "warnings": self.warnings,
@@ -195,18 +231,17 @@ def infer_query(
     normalized = " ".join(query.lower().split())
     recap = is_narrative_history_recap(query)
     interval_origin = None
+    interval = None
     if recap:
-        natural = supplied_recap_window(query, now.tzinfo, timezone_declared=natural_timezone_declared)
-        if natural:
-            natural_start, natural_end = natural
-            if date_window_start is not None and (date_window_start != natural_start or date_window_end != natural_end):
-                raise ValueError("Recap prose bounds conflict with --since/--until; provide one consistent interval.")
-            if date_window_start is None:
-                date_window_start, date_window_end = natural
+        explicit = (RecordTimeInterval(date_window_start, date_window_end)
+                    if date_window_start is not None and date_window_end is not None else None)
+        natural = supplied_recap_window(query, now.tzinfo,
+            timezone_declared=natural_timezone_declared, explicit_interval=explicit)
+        interval = natural or explicit
+        if interval:
+            date_window_start, date_window_end = interval.start, interval.end
+            if natural is not None and explicit is None:
                 date_reason = "explicit_prose_window"
-        if date_window_start is not None and date_window_end is not None:
-            if date_window_end <= date_window_start:
-                raise ValueError("Recap interval end must be later than its start.")
             interval_origin = date_reason or "supplied_record_time_window"
     inferred_role = role or infer_role(normalized)
     role_filter_explicit = role is not None
@@ -261,6 +296,7 @@ def infer_query(
         query_plan=query_plan,
         chronology_mode='supplied_interval' if interval_origin else 'latest_human' if is_direct_latest_message_history_query(query) else None,
         interval_origin=interval_origin,
+        record_time_interval=interval,
     )
 
 
@@ -410,30 +446,41 @@ def is_narrative_history_recap(query):
     return recap and not re.search(r'\b(?:why|how)\b', text)
 
 
-def supplied_recap_window(query, default_tz, *, timezone_declared=False):
-    """Only an unambiguous inclusive-start/exclusive-end ISO relation is admitted.
+def supplied_recap_window(query, default_tz, *, timezone_declared=False, explicit_interval=None):
+    """Resolve requested record-time relations without authenticating named events.
 
-    Date-only, relative, competing and inclusive-end spans need clarification;
-    their interpretation must not silently select an unrelated native human.
+    Independently asserted endpoints must agree with CLI bounds even when the
+    other prose endpoint is unknown. Quotes supply content, not caller bounds.
     """
+    text = re.sub(r'"(?:\\.|[^"\\])*"|“[^”]*”|`[^`]*`|(?<!\w)\'[^\'\n]+\'(?!\w)|‘[^’]*’',
+                  lambda match: ' ' * len(match.group()), query)
     date = r'\d{4}-\d{2}-\d{2}'
-    instant = date + r'[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})?'
-    # A dated subject is not a requested temporal boundary. Require a relation
-    # directly attached to a concrete endpoint before validating prose bounds.
-    attempted_endpoints = list(re.finditer(
-        r'\b(?:from|since|after|between|until|before|through|to)\s+'
-        r'(?:(?:and\s+)?(?:including|excluding)\s+)?' + date, query, re.I))
-    if not attempted_endpoints:
+    clock = r'[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})?'
+    instant = date + clock
+    value = r'(' + date + r'(?:' + clock + r')?)(?![\w:+-]|[.,]\d)'
+    relation = r'\b(from|since|after|until|before|through|between|to)(?:\s+|(?=\d))'
+    named_relation = r'\b(from|since|after)\s+(?!' + date + r')([^.!?;,\n]+?)\s+at\s*'
+    direct = list(re.finditer(relation + value, text, re.I))
+    named = list(re.finditer(named_relation + value, text, re.I))
+    attempted = list(re.finditer(relation + date, text, re.I)) + list(re.finditer(named_relation + date, text, re.I))
+    # A documentary date is not a request for activity during that date range.
+    if not attempted:
+        if is_direct_latest_message_history_query(query) or not re.search(r'\b(?:from|since|after|between|until|before|through)\s+', text, re.I):
+            return None
+    if re.search(r'\b(?:published|dated|titled)\s*$', text[:min(
+            [m.start() for m in direct + named], default=len(text))], re.I):
         return None
-    spans = list(re.finditer(r'\b(?:from|since)\s+(' + instant + r')\s+(?:until|before)\s+(' + instant + r')(?![\w:+-])', query, re.I))
-    if len(spans) != 1 or len(attempted_endpoints) != 2:
-        raise ValueError("Unresolved recap interval: use 'from <ISO timestamp> until <ISO timestamp>' (exclusive end), or --since/--until; date-only, through/to and competing bounds are ambiguous.")
-    endpoint_suffix = query[spans[0].end():]
-    if re.match(r'\s*,?\s*(?:or|and)\s+' + date, endpoint_suffix, re.I):
+    endpoints = [(m.start(), m.end(), m[1].lower(), m[2]) for m in direct]
+    endpoints += [(m.start(), m.end(), m[1].lower(), m[3]) for m in named]
+    endpoints.sort()
+    if {m.start() for m in attempted} != {item[0] for item in endpoints}:
+        raise ValueError("Unsupported recap timestamp spelling; supply complete ISO timestamps and explicit offsets without trailing zone names or extra precision.")
+    if any(op in {'between', 'to'} for _, _, op, _ in endpoints) or re.search(r'\bbetween\s+', text, re.I):
+        raise ValueError("Unresolved recap interval: use from/since/after <ISO timestamp> until/before/through <ISO timestamp>, with explicit endpoint meaning.")
+    lower = [item for item in endpoints if item[2] in {'from', 'since', 'after'}]
+    upper = [item for item in endpoints if item[2] in {'until', 'before', 'through'}]
+    if len(lower) > 1 or len(upper) > 1:
         raise ValueError("Competing recap endpoints are unresolved; provide one interval.")
-    # The parsed span supplies endpoint referents: scope words can qualify them
-    # with or without a repeated noun. Inclusion verbs still need a temporal
-    # object, so recap contents such as 'including failures' remain separate.
     endpoint_scope = r'(?:both|each|either|neither|all)'
     endpoint_noun = (r'(?:(?:the|this|that|' + endpoint_scope + r')\s+)?'
                      r'(?:(?:lower|upper|first|last|initial|final)\s+)?'
@@ -444,18 +491,58 @@ def supplied_recap_window(query, default_tz, *, timezone_declared=False):
                      r'(?:' + endpoint_scope + r'\s+)?' + disposition)
     inclusion = (r'(?:' + qualification + r'|(?:including|excluding)\s+(?:'
                  + endpoint_noun + '|' + date + '))')
-    if re.match(r'\s*(?:[,;]\s*)?(?:\(\s*)?(?:(?:and|with)\s+)?' + inclusion, endpoint_suffix, re.I):
-        raise ValueError("Qualified recap endpoint inclusion is unresolved; use --since (inclusive) and --until (exclusive).")
-    endpoints = spans[0].groups()
-    if not timezone_declared and any(not re.search(r'(?:Z|[+-]\d{2}:\d{2})$', value, re.I) for value in endpoints):
-        raise ValueError("Recap prose timestamps need offsets or an explicit --timezone/--timezone-offset.")
-    parsed = tuple(parse_datetime(value.replace('t', 'T').replace('z', 'Z'), default_tz) for value in endpoints)
-    if any(value is None for value in parsed) or parsed[1] <= parsed[0]:
-        raise ValueError("Recap interval needs valid ISO timestamps with end later than start.")
-    for source, value in zip(endpoints, parsed):
-        if not re.search(r'(?:Z|[+-]\d{2}:\d{2})$', source, re.I) and value.replace(fold=0).utcoffset() != value.replace(fold=1).utcoffset():
+    explicit_qualification = (r'(?:' + endpoint_subject + r'\s+(?:(?:is|are|being)\s+)?' + disposition
+                              + '|' + disposition + r'\s+' + endpoint_noun
+                              + r'|(?:including|excluding)\s+(?:' + endpoint_noun + '|' + date + '))')
+    if re.search(explicit_qualification, text, re.I):
+        raise ValueError("Qualified recap endpoint inclusion is unresolved; state one consistent interval.")
+    for _, end, _, _ in endpoints:
+        suffix = text[end:]
+        if re.match(r'\s*,?\s*(?:or|and)\s+' + date, suffix, re.I):
+            raise ValueError("Competing recap endpoints are unresolved; provide one interval.")
+        if re.match(r'\s*(?:[,;]\s*)?(?:\(\s*)?(?:(?:and|with)\s+)?' + inclusion, suffix, re.I):
+            raise ValueError("Qualified recap endpoint inclusion is unresolved; state one consistent interval without extra inclusion qualifiers.")
+    if re.search(relation + r'(?:(?:and\s+)?(?:including|excluding)|inclusive|exclusive)\b', text, re.I):
+        raise ValueError("Qualified recap endpoint inclusion is unresolved; state one consistent interval.")
+    if re.search(relation + r'(?:today|yesterday|tomorrow|(?:last|next|this)\s+(?:day|night|week|month|year|morning|evening)|\d{1,2}:\d{2})\b', text, re.I):
+        raise ValueError("Relative recap endpoints are unresolved; supply explicit ISO timestamps and offsets.")
+    parsed = {}
+    for _, _, op, source in endpoints:
+        if not re.fullmatch(instant, source, re.I):
+            raise ValueError("Recap bounds need full ISO clock timestamps; date-only or relative endpoints are unresolved.")
+        if re.search(r'\.\d{7,}', source):
+            raise ValueError("Recap timestamps support at most six fractional digits; provide exact supported bounds without rounding.")
+        zoned = bool(re.search(r'(?:Z|[+-]\d{2}:\d{2})$', source, re.I))
+        if not zoned and not timezone_declared:
+            raise ValueError("Recap prose timestamps need offsets or an explicit --timezone/--timezone-offset.")
+        timestamp = parse_datetime(source.replace('t', 'T').replace('z', 'Z'), default_tz)
+        if timestamp is None:
+            raise ValueError("Recap interval needs valid ISO timestamps with end later than start.")
+        if not zoned and timestamp.replace(fold=0).utcoffset() != timestamp.replace(fold=1).utcoffset():
             raise ValueError("Ambiguous or nonexistent local recap clock time; supply explicit ISO offsets.")
-    return parsed
+        inclusive = op in {'from', 'since', 'through'}
+        is_lower = op in {'from', 'since', 'after'}
+        parsed['start' if is_lower else 'end'] = (timestamp, inclusive)
+        if explicit_interval and (timestamp != (explicit_interval.start if is_lower else explicit_interval.end)
+                or inclusive != (explicit_interval.start_inclusive if is_lower else explicit_interval.end_inclusive)):
+            raise ValueError("Recap prose bounds or inclusion operators conflict with --since/--until; provide one consistent interval.")
+    description = named[0][2].strip() if named else None
+    if lower and upper:
+        if lower[0][1] >= upper[0][0] or text[lower[0][1]:upper[0][0]].strip():
+            raise ValueError("Unresolved recap interval: provide one adjacent lower and upper ISO relation.")
+        start, start_inclusive = parsed['start']
+        end, end_inclusive = parsed['end']
+        return RecordTimeInterval(start, end, start_inclusive, end_inclusive, description)
+    if explicit_interval:
+        # A named but untimed event can coexist with explicit record-time bounds;
+        # any independently supplied prose constraint was checked above.
+        event = re.search(r'\b(?:from|since|after)\s+([^.!?;,\n]+)', text, re.I)
+        description = text[event.start(1):upper[0][0] if upper else event.end(1)].strip() if event and not lower else None
+        if description:
+            return RecordTimeInterval(explicit_interval.start, explicit_interval.end,
+                                      explicit_interval.start_inclusive, explicit_interval.end_inclusive, description)
+        return explicit_interval
+    raise ValueError("Unresolved recap interval: supply explicit ISO start and end with from/since/after and until/before/through, or --since/--until. Event names alone do not establish record-time bounds.")
 
 
 def is_direct_latest_message_history_query(query):
