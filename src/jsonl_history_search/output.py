@@ -594,7 +594,15 @@ def render_history_evidence(payload: dict) -> str:
     if 'chronology' in payload:
         chronology = payload['chronology']
         lines.append('Chronological scope: ' + chronology['scope'])
-        lines.append('Supported chronology complete: ' + str(payload['coverage']['complete']))
+        lines.append('Source/time/boundary acquisition complete: ' + str(payload['coverage']['complete']))
+        retained = chronology['retained']
+        lines.append('Retained event-core membership complete: %s; omitted event cores: %s' % (
+            retained['core_membership_complete'], payload['omissions']['retention_records']))
+        lines.append('Retained text complete: %s; clipped retained records: %s' % (
+            retained['text_complete'], payload['omissions']['clipped_retained_records']))
+        if retained.get('first_unrepresented_ref'):
+            lines.append('First unrepresented native ref: ' + ref_target(retained['first_unrepresented_ref'])
+                + '; open it with read-more --mode record under the same admitted root. Event core coverage is partial.')
         if chronology.get('boundary'):
             lines.append('Acquisition boundary: ' + json.dumps(chronology['boundary'], ensure_ascii=False))
         anchor = chronology.get('anchor')
@@ -608,17 +616,15 @@ def render_history_evidence(payload: dict) -> str:
         if artifact:
             lines.extend(['Read the report as plain text: ' + artifact['path'],
                 'Report bytes: %s; SHA256: %s' % (artifact['bytes'], artifact['sha256']),
-                'Core membership complete: %s; core bytes: %s; optional preview bytes: %s; framing bytes: %s' % (
+                'Report event-core membership complete: %s; core bytes: %s; optional preview bytes: %s; framing bytes: %s' % (
                     artifact['core_membership_complete'], artifact['core_bytes'], artifact['optional_preview_bytes'], artifact['framing_bytes']),
-                'Projection complete: %s; omitted union records: %s' % (artifact['projection_complete'], artifact['omitted_records']),
-                'Returned text complete: %s; source readback needed: %s' % (artifact['returned_text_complete'], artifact['requires_source_readback']),
+                'Report projection complete: %s; report omitted records: %s' % (artifact['projection_complete'], artifact['omitted_records']),
+                'Returned tool-result text complete: %s; omitted text bytes in emitted tool results: %s; source readback needed: %s' % (
+                    artifact['returned_text_complete'], artifact['omitted_returned_text_bytes_in_emitted_records'], artifact['requires_source_readback']),
                 'Scope/cutoff: %s | %s' % (chronology['scope'], chronology['cutoff']),
                 'Check END OF BOUNDED CHRONOLOGY REPORT after reading; a truncated read is incomplete.',
                 'This report contains bounded retained evidence; follow its native read-more refs for omitted text. Child activity is not established complete.',
                 payload['claim_boundary']])
-            if artifact.get('first_unrepresented_ref'):
-                lines.append('First unrepresented native ref: ' + ref_target(artifact['first_unrepresented_ref'])
-                    + '; open it with read-more --mode record under the same admitted root. Event core coverage is partial.')
             return '\n'.join(lines)
         for item in payload['evidence']:
             if item.get('records'):
