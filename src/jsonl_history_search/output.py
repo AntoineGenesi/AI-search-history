@@ -1036,11 +1036,15 @@ def _bounded_projection_value(value: object, limit: int = 600) -> str:
     return f"{text[: max(0, limit - 18)]}... [value capped]"
 
 
-def _cap_utf8_projection(text: str, limit: int) -> str:
+def _cap_utf8_projection(
+    text: str,
+    limit: int,
+    *,
+    suffix: str = "\n[projection capped at configured UTF-8 byte budget]",
+) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= limit:
         return text
-    suffix = "\n[projection capped at configured UTF-8 byte budget]"
     suffix_bytes = suffix.encode("utf-8")
     prefix = encoded[: max(0, limit - len(suffix_bytes))].decode("utf-8", errors="ignore")
     return prefix + suffix
@@ -3813,6 +3817,16 @@ def render_source_expansion_text(payload: dict) -> str:
         f"Mode: {report.get('mode')}",
         f"Target: {report.get('requested_target')}",
     ]
+    rejected_roots = (report.get("scope") or {}).get("rejected_roots") or []
+    if rejected_roots:
+        lines.append(f"Rejected roots: {len(rejected_roots)}")
+        for rejected in rejected_roots[:5]:
+            reason = str(rejected.get("reason") or "")
+            reason = "".join(character if character.isprintable() else " " for character in reason)
+            reason = _cap_utf8_projection(reason, 1024, suffix=" [reason clipped]")
+            lines.append(f"- Rejected root reason: {reason}")
+        if len(rejected_roots) > 5:
+            lines.append(f"Rejected root reasons omitted: {len(rejected_roots) - 5}")
     line_range = report.get("line_range") or {}
     if line_range:
         lines.append(f"Lines: {line_range.get('start')}..{line_range.get('end')} (anchor {line_range.get('anchor')})")
