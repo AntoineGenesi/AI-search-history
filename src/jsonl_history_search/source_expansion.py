@@ -1108,6 +1108,7 @@ def build_source_expansion_payload(
         ],
         "scope": source_scope(plan),
     }
+    payload["source_continuation"]["observed_current_tail_target"] = ref_target(evidence_ref(records[-1]))
     if native_span and request.mode == 'record':
         payload['boundary_flags']['start_of_source_reached'] = native_span[1] == 0
         payload['boundary_flags']['end_of_source_reached'] = native_span[2] == native_scan.get('snapshot_bytes')
@@ -1175,8 +1176,21 @@ def build_source_expansion_payload(
         }
     if native_span and request.mode == 'record':
         payload['continuation'] = {'semantics': 'Exact native byte record; surrounding record counts unknown.',
-            'more_before_available': None, 'more_after_available': None, 'next_steps': []}
-        payload['source_positions']['meaning'] = 'position within exact byte read; not source-wide order or physical lines'
+            'more_before_available': None, 'more_after_available': None,
+            'next_steps': ([
+                {'direction': 'before', 'target': ref_target(evidence_ref(selected[0])),
+                 'mode': 'before', 'before': request.before or request.max_records,
+                 'max_records': request.max_records, 'scope': request.scope,
+                 'availability': 'unknown', 'probe': True},
+                {'direction': 'after', 'target': ref_target(evidence_ref(selected[-1])),
+                 'mode': 'next', 'next_count': request.next_count or request.max_records,
+                 'max_records': request.max_records, 'scope': request.scope,
+                 'availability': 'unknown', 'probe': True},
+            ] if selected else [])}
+        payload['source_positions'] = {'anchor': None, 'start': None, 'end': None,
+            'meaning': 'source-wide order unknown after exact native byte read'}
+        for row in payload['records']:
+            row['source_position'] = None
     return {"source_expansion": payload}
 
 
