@@ -85,7 +85,7 @@ from .mechanism_eval import DEFAULT_FIXTURE as DEFAULT_MECHANISM_EVAL_FIXTURE
 from .mechanism_eval import build_mechanism_eval_payload
 from .measured_benchmark import DEFAULT_FIXTURE as DEFAULT_MEASURED_FIXTURE
 from .measured_benchmark import build_measured_benchmark_payload
-from .output import project_semantic_debug_continuation_step, render
+from .output import project_semantic_debug_continuation_step, render, render_bounded_source_expansion
 from .paired_agent_benchmark_protocol import build_paired_agent_benchmark_protocol_payload
 from .private_benchmark_mine import build_private_benchmark_mine_payload
 from .profiling import AskExecutePhaseEmitter, finish_phase_profile, start_phase_profile
@@ -340,7 +340,12 @@ def build_parser(*, public_help: bool = True) -> argparse.ArgumentParser:
     read_more.add_argument("--next-count", type=int, default=3)
     read_more.add_argument("--max-records", type=int, default=20)
     read_more.add_argument("--projection", choices=("full", "compact"), default=None)
-    read_more.add_argument("--compact-text-limit", type=int, default=1200)
+    read_more.add_argument("--compact-text-limit", type=int, default=1200,
+                           help="Compact decoded-text character preference; serialized output has a separate byte bound.")
+    read_more.add_argument("--max-output-bytes", type=_read_more_output_budget, default=65536,
+                           help="Whole evidence stdout UTF8 byte budget including framing/newline (default 65536, minimum 4096).")
+    read_more.add_argument("--text-cursor", default=None,
+                           help="Full decoded-text continuation: v1:<sha256>:<UTF8 byte offset>; record/full only.")
     follow_next_reads = subparsers.add_parser(
         "follow-next-reads",
         description=(
@@ -1835,6 +1840,39 @@ def add_retrieval_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Compatibility alias for --fielded-bm25-storage memory.",
     )
+
+
+def _read_more_output_budget(value: str) -> int:
+    try:
+        budget = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--max-output-bytes requires an integer >=4096") from exc
+    if budget < 4096:
+        raise argparse.ArgumentTypeError("--max-output-bytes must be >=4096")
+    return budget
+
+
+def _read_more_context_argv(args: argparse.Namespace, source_plan: dict) -> list[str]:
+    """Serialize the admitted source context, without replacing its permissions."""
+    values = {name: getattr(args, name.replace("-", "_")) for name in (
+        "role", "max-files", "max-bytes", "max-matches", "max-elapsed", "timezone", "timezone-offset",
+        "since", "until", "hard-cap-files", "hard-cap-bytes", "mask-manifest", "mask-mode", "redaction-profile",
+        "bm25-max-candidate-rows", "bm25-query-timeout", "fielded-bm25-index-dir", "fielded-bm25-storage", "rrf-fusion-storage",
+    )}
+    values.update({"cwd": source_plan["cwd"], "now": source_plan["now"],
+                   "codex-home": source_plan["codex_home"], "claude-home": source_plan["claude_home"]})
+    for provider, root in source_plan["provider_roots"].items():
+        values[provider + ("-root" if provider in {"aider", "opencode"} else "-home")] = root
+    argv = []
+    for name, value in values.items():
+        if value is not None:
+            argv.extend(["--" + name, str(value)])
+    for root in args.root:
+        argv.extend(["--root", str(Path(root).expanduser().resolve())])
+    for name in ("allow-arbitrary-root", "rg-prefilter", "fielded-bm25-ephemeral"):
+        if getattr(args, name.replace("-", "_")):
+            argv.append("--" + name)
+    return argv
 
 
 def _json_object_argument(value: str) -> dict:
@@ -4034,13 +4072,22 @@ def main(argv: list[str] | None = None) -> int:
                 max_records=args.max_records,
                 projection=projection,
                 compact_text_limit=args.compact_text_limit,
+                text_cursor=args.text_cursor,
             ),
             plan=plan,
             default_tz=timezone_from_args(args.timezone, args.timezone_offset),
             cwd=Path(args.cwd).expanduser().resolve(),
             now_utc=parse_datetime(source_plan.get("now"), timezone.utc),
         )
-        print(render(payload, args.format))
+        invocation = list(getattr(sys, "orig_argv", []))
+        command_prefix = (invocation[:invocation.index("read-more")]
+                          if argv is None and "read-more" in invocation
+                          else [sys.executable, "-m", "jsonl_history_search"])
+        rendered = render_bounded_source_expansion(
+            payload, args.format, max_output_bytes=args.max_output_bytes,
+            command_prefix=command_prefix, context_argv=_read_more_context_argv(args, source_plan),
+        )
+        print(rendered)
         return 0 if payload["source_expansion"]["status"] == "expanded" else 1
     if args.command == "follow-next-reads":
         args.query = str(args.from_report)

@@ -98,6 +98,7 @@ class ExpansionRequest:
     max_records: int = DEFAULT_MAX_RECORDS
     projection: str = "full"
     compact_text_limit: int = 1200
+    text_cursor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -936,6 +937,12 @@ def build_source_expansion_payload(
         return {"source_expansion": {**base_payload, "status": "invalid_scope", "records": []}}
     if request.projection not in {"full", "compact"}:
         return {"source_expansion": {**base_payload, "status": "invalid_projection", "records": []}}
+    if request.text_cursor is not None and (
+        request.mode != "record" or request.projection != "full"
+        or not re.fullmatch(r"v1:[0-9a-f]{64}:[0-9]+", request.text_cursor)
+    ):
+        return {"source_expansion": {**base_payload, "status": "invalid_text_cursor", "records": [],
+                "error": "text cursor requires record/full and v1:<sha256>:<UTF8 byte offset>"}}
     if not parsed.path_text:
         return {"source_expansion": {**base_payload, "status": "missing_path", "records": []}}
     if parsed.line is None and not parsed.native_ref:
@@ -1124,6 +1131,30 @@ def build_source_expansion_payload(
                          "mode": "next", "next_count": request.next_count or request.max_records,
                          "max_records": request.max_records, "scope": request.scope}] if selected and end_position < total_records else []),
     }
+    for row, position in zip(payload["records"], selected_positions):
+        row["source_position"] = position
+    if request.text_cursor is not None:
+        row = payload["records"][0] if payload["records"] else None
+        _, digest, offset_text = request.text_cursor.split(":")
+        # Compare decimal offsets before conversion: arbitrarily large cursor
+        # integers must refuse rather than raise Python's integer parsing limit.
+        offset_digits = offset_text.lstrip("0") or "0"
+        if row is None or digest != row["text_sha256"]:
+            return {"source_expansion": {**base_payload, "status": "stale_text_cursor", "records": []}}
+        if len(offset_digits) > len(str(row["raw_text_bytes"])):
+            return {"source_expansion": {**base_payload, "status": "invalid_text_cursor", "records": [],
+                    "error": "text cursor offset is outside the decoded record"}}
+        offset = int(offset_digits)
+        raw_text = row["text"].encode("utf-8")
+        try:
+            if offset > len(raw_text):
+                raise ValueError("text cursor offset is outside the decoded record")
+            row["text"] = raw_text[offset:].decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return {"source_expansion": {**base_payload, "status": "invalid_text_cursor", "records": [],
+                    "error": "text cursor offset must be a UTF8 boundary within the decoded record"}}
+        row["text_byte_start"] = offset
+        row["projected_text_bytes"] = len(raw_text) - offset
     live_tail_caveat = payload["live_tail_caveat"]
     if live_tail_caveat.get("applies"):
         payload["claim_boundaries"] = {
@@ -3167,7 +3198,13 @@ def select_records(
     scoped_records = filter_records_by_scope(candidate_records, records[anchor_position - 1], scope=scope)
     scope_filtered_count = max(0, requested_count - len(scoped_records))
     if max_records > 0:
-        selected = scoped_records[-max_records:] if mode == "before" else scoped_records[:max_records]
+        if mode in {"window", "neighborhood"}:
+            anchor_index = next((i for i, record in enumerate(scoped_records)
+                                 if evidence_identity(record) == evidence_identity(records[anchor_position - 1])), 0)
+            first = max(0, min(anchor_index - max_records // 2, len(scoped_records) - max_records))
+            selected = scoped_records[first:first + max_records]
+        else:
+            selected = scoped_records[-max_records:] if mode == "before" else scoped_records[:max_records]
     else:
         selected = []
     if not selected:
@@ -3241,7 +3278,6 @@ def record_session(record: Any) -> str | None:
 
 
 COMPACT_SUPPRESSED_ROLES = {"token_count"}
-COMPACT_SUMMARY_ROLES = {"exec_command_end", "function_call_output", "tool_result", "tool_output"}
 
 
 def source_expansion_projection_summary(
@@ -3270,7 +3306,7 @@ def source_expansion_projection_summary(
         "truncated_record_count": sum(1 for item in projected if item["truncated"]),
         "compact_text_limit": compact_text_limit,
         "suppressed_roles": sorted(COMPACT_SUPPRESSED_ROLES),
-        "summary_roles": sorted(COMPACT_SUMMARY_ROLES),
+        "preview_policy": "all roles above the compact character preference",
         "claim_boundary": "compact projection preserves source refs and bounded text previews; it is not a full raw transcript dump",
     }
 
@@ -3281,7 +3317,7 @@ def compact_record_text(record: Any, *, compact_text_limit: int) -> dict[str, An
     raw_bytes = len(text.encode("utf-8"))
     if role in COMPACT_SUPPRESSED_ROLES:
         return {
-            "text": f"[suppressed {role} record; raw_text_bytes={raw_bytes}]",
+            "text": "",
             "raw_text_bytes": raw_bytes,
             "projected_text_bytes": 0,
             "suppressed": True,
@@ -3289,16 +3325,15 @@ def compact_record_text(record: Any, *, compact_text_limit: int) -> dict[str, An
             "projection_reason": "low_signal_runtime_metadata",
         }
     limit = max(0, int(compact_text_limit))
-    if role in COMPACT_SUMMARY_ROLES and raw_bytes > limit:
-        preview = text[:limit].rstrip()
-        omitted = max(0, raw_bytes - len(preview.encode("utf-8")))
+    if len(text) > limit:
+        preview = text[:limit]
         return {
-            "text": f"{preview}\n[truncated {role} record; raw_text_bytes={raw_bytes}; omitted_bytes~={omitted}]",
+            "text": preview,
             "raw_text_bytes": raw_bytes,
             "projected_text_bytes": len(preview.encode("utf-8")),
             "suppressed": False,
             "truncated": True,
-            "projection_reason": "large_tool_output_preview",
+            "projection_reason": "large_record_preview",
         }
     return {
         "text": text,
@@ -3346,6 +3381,22 @@ def expanded_record(
         "text_truncated": projected["truncated"],
         "text_suppressed": projected["suppressed"],
     }
+    text = str(record.text or "")
+    row["text_byte_start"] = 0
+    row["text_byte_end"] = projected["projected_text_bytes"]
+    row["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if projection == "compact" and (projected["truncated"] or projected["suppressed"]):
+        row["preview_envelope"] = {
+            "synthetic": True,
+            "meaning": "text is a decoded source prefix; this envelope is not verbatim source",
+            "omitted_text_bytes": row["raw_text_bytes"] - row["text_byte_end"],
+        }
+    raw = record.raw if isinstance(getattr(record, "raw", None), dict) else {}
+    payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
+    item = payload.get("item") if isinstance(payload.get("item"), dict) else payload
+    if item.get("type") == "CommandExecution":
+        row["native_item"] = {key: item[key] for key in ("type", "command", "status", "exit_code", "error")
+                              if key in item}
     if getattr(record, 'import_provenance', None) is not None:
         row['import_provenance'] = record.import_provenance
     return row

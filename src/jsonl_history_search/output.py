@@ -3803,11 +3803,228 @@ def render_failure_analysis_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def render_bounded_source_expansion(
+    payload: dict,
+    output_format: str,
+    *,
+    max_output_bytes: int,
+    command_prefix: list[str],
+    context_argv: list[str],
+) -> str:
+    """Fit the actual wire representation, keeping selection separate from delivery.
+
+    Source expansion owns admission, text identity and selection. This boundary
+    owns only which selected evidence fits, and measures the same renderer the
+    CLI prints (including its final newline).
+    """
+    report = payload["source_expansion"]
+    selected = list(report.get("records") or [])
+    selected_count = len(selected)
+    projections = {row["target"]: {
+        "end": row["text_byte_end"], "bytes": row["projected_text_bytes"],
+        "truncated": row["text_truncated"], "suppressed": row["text_suppressed"],
+    } for row in selected}
+    source_positions = dict(report.get("source_positions") or {})
+    source_boundaries = dict(report.get("boundary_flags") or {})
+    source_continuation = dict(report.get("continuation") or {})
+    delivery = {"max_output_bytes": max_output_bytes, "serialized_output_bytes": 0,
+                "complete": True}
+    report["delivery"] = delivery
+    if report.get("status") == "expanded":
+        report["source_acquisition"] = {
+            "selected_line_range": dict(report["line_range"]),
+            "selected_positions": source_positions,
+            "boundary_flags": source_boundaries,
+            "meaning": "source selection before wire delivery; text pages do not establish source extent",
+        }
+
+    def argv_for(step: dict) -> list[str]:
+        argv = command_prefix + ["read-more", step["target"]] + context_argv
+        values = {"mode": step.get("mode", "record"), "scope": step.get("scope", report.get("limits", {}).get("scope", "source")),
+                  "projection": step.get("projection", report.get("projection", "full")),
+                  "before": step.get("before", report.get("limits", {}).get("before", 2)),
+                  "after": step.get("after", report.get("limits", {}).get("after", 2)),
+                  "next-count": step.get("next_count", report.get("limits", {}).get("next_count", 3)),
+                  "max-records": step.get("max_records", report.get("limits", {}).get("max_records", 20)),
+                  "compact-text-limit": report.get("limits", {}).get("compact_text_limit", 1200),
+                  "format": output_format, "max-output-bytes": max_output_bytes}
+        for name, value in values.items():
+            argv.extend(["--" + name, str(value)])
+        if step.get("text_cursor") is not None:
+            argv.extend(["--text-cursor", step["text_cursor"]])
+        return argv
+
+    tail = report.get("source_continuation") or {}
+    if tail.get("terminal_claim_requires_tail_followup") and tail.get("tail_target"):
+        step = {"target": tail["tail_target"], "mode": "window", "after": 0,
+                "before": report.get("limits", {}).get("before", 2)}
+        tail["exact_next_read_more_command"] = shlex.join(argv_for(step))
+
+    def refresh() -> None:
+        rows = report.get("records") or []
+        omitted = selected_count - len(rows)
+        body_omitted = sum(max(0, projections[row["target"]]["end"] - row["text_byte_end"]) for row in rows)
+        delivery.update({"complete": not omitted and not body_omitted,
+                         "selected_count": selected_count, "delivered_count": len(rows),
+                         "omitted_record_count": omitted, "omitted_body_bytes": body_omitted,
+                         "omitted_metadata": False,
+                         "delivered_text_bytes": sum(row["projected_text_bytes"] for row in rows)})
+        if report.get("status") != "expanded":
+            return
+        counts = report["counts"]
+        counts["selected_count"] = selected_count
+        counts["included_count"] = len(rows)
+        counts["omitted_count"] = max(0, counts["requested_count"] - len(rows))
+        counts["omitted_or_truncated_count"] = counts["omitted_count"]
+        report["truncated"] = bool(counts["omitted_count"] or body_omitted)
+        continuation = {**source_continuation, "next_steps": []}
+        report["continuation"] = continuation
+        if not rows:
+            return
+        first, last = rows[0], rows[-1]
+        start, end = first["source_position"], last["source_position"]
+        report["line_range"].update({"start": first["line"], "end": last["line"]})
+        report["source_positions"].update({"start": start, "end": end})
+        report["boundary_flags"] = dict(source_boundaries)
+        if omitted:
+            for key in ("start_of_source_reached", "start_of_candidate_range_reached"):
+                report["boundary_flags"][key] = bool(source_boundaries.get(key) and start == source_positions.get("start"))
+            for key in ("end_of_source_reached", "end_of_candidate_range_reached"):
+                report["boundary_flags"][key] = bool(source_boundaries.get(key) and end == source_positions.get("end"))
+        if body_omitted:
+            report["boundary_flags"]["end_of_source_reached"] = False
+            report["boundary_flags"]["end_of_candidate_range_reached"] = False
+        extent_known = report.get("total_records_in_source") is not None
+        if extent_known:
+            continuation["more_before_available"] = start > 1
+            continuation["more_after_available"] = end < report["total_records_in_source"]
+        steps = continuation["next_steps"]
+        for row in rows:
+            if row["text_byte_end"] < row["raw_text_bytes"] or row.get("text_suppressed"):
+                offset = row["text_byte_end"] if row.get("projection") == "full" else 0
+                steps.append({"direction": "within_record", "target": row["target"],
+                              "mode": "record", "projection": "full",
+                              "text_cursor": f"v1:{row['text_sha256']}:{offset}"})
+        limits = report["limits"]
+        if extent_known and start > 1:
+            steps.append({"direction": "before", "target": first["target"], "mode": "before",
+                          "before": limits["before"] or limits["max_records"],
+                          "max_records": limits["max_records"], "scope": limits["scope"]})
+        if extent_known and end < report["total_records_in_source"]:
+            steps.append({"direction": "after", "target": last["target"], "mode": "next",
+                          "next_count": limits["next_count"] or limits["max_records"],
+                          "max_records": limits["max_records"], "scope": limits["scope"]})
+        for step in steps:
+            step["argv"] = argv_for(step)
+        if omitted:
+            delivery["omitted_record_ranges"] = [
+                {"start": side[0]["line"], "end": side[-1]["line"], "count": len(side)}
+                for side in ([row for row in selected if row["source_position"] < start],
+                             [row for row in selected if row["source_position"] > end]) if side
+            ]
+        else:
+            delivery.pop("omitted_record_ranges", None)
+        summary = report.get("projection_summary") or {}
+        summary["selected_raw_text_bytes"] = summary.get("selected_raw_text_bytes", summary.get("raw_text_bytes", 0))
+        summary["selected_projected_text_bytes"] = sum(item["bytes"] for item in projections.values())
+        summary["projection_omitted_text_bytes"] = sum(
+            row["raw_text_bytes"] - projections[row["target"]]["end"]
+            for row in rows if row.get("projection") == "compact")
+        summary["raw_text_bytes"] = sum(row["raw_text_bytes"] for row in rows)
+        summary["projected_text_bytes"] = sum(projections[row["target"]]["bytes"] for row in rows)
+        summary["suppressed_record_count"] = sum(projections[row["target"]]["suppressed"] for row in rows)
+        summary["truncated_record_count"] = sum(projections[row["target"]]["truncated"] for row in rows)
+
+    def serialized() -> str:
+        # Only decimal digit widths can change while closing this fixed point.
+        while True:
+            rendered = render(payload, output_format)
+            size = len((rendered + "\n").encode("utf-8"))
+            if delivery["serialized_output_bytes"] == size:
+                return rendered
+            delivery["serialized_output_bytes"] = size
+
+    refresh()
+    rendered = serialized()
+    if delivery["serialized_output_bytes"] <= max_output_bytes:
+        return rendered
+    # Keep a contiguous interval around the requested anchor. Before/next pages
+    # retain their nearest boundary so exclusive continuation makes progress.
+    rows = report.get("records") or []
+    while len(rows) > 1:
+        anchor = source_positions.get("anchor", rows[0]["source_position"])
+        remove_first = abs(rows[0]["source_position"] - anchor) > abs(rows[-1]["source_position"] - anchor)
+        rows.pop(0 if remove_first else -1)
+        refresh()
+        rendered = serialized()
+        if delivery["serialized_output_bytes"] <= max_output_bytes:
+            return rendered
+    if rows:
+        row = rows[0]
+        text = row["text"]
+        original_end = row["text_byte_end"]
+        original_truncated = row["text_truncated"]
+
+        def set_prefix(characters: int) -> None:
+            row["text"] = text[:characters]
+            row["projected_text_bytes"] = len(row["text"].encode("utf-8"))
+            row["text_byte_end"] = row["text_byte_start"] + row["projected_text_bytes"]
+            row["delivery_text_truncated"] = row["text_byte_end"] < original_end
+            row["text_truncated"] = original_truncated or row["delivery_text_truncated"]
+            if row.get("preview_envelope"):
+                row["preview_envelope"]["omitted_text_bytes"] = row["raw_text_bytes"] - row["text_byte_end"]
+            refresh()
+
+        set_prefix(0)
+        rendered = serialized()
+        if delivery["serialized_output_bytes"] <= max_output_bytes:
+            low, high = 0, len(text)
+            while low < high:
+                middle = (low + high + 1) // 2
+                set_prefix(middle)
+                serialized()
+                if delivery["serialized_output_bytes"] <= max_output_bytes:
+                    low = middle
+                else:
+                    high = middle - 1
+            set_prefix(low)
+            rendered = serialized()
+            if low or not text:
+                return rendered
+    # Required identity/context metadata is never silently clipped. A compact
+    # refusal conveys neither evidence nor a cursor that cannot advance.
+    source_status = report.get("status")
+    payload["source_expansion"] = {
+        "schema_version": 1, "status": "delivery_envelope_too_large",
+        "source_status": source_status, "records": [],
+        "error": "Required exact evidence envelope cannot fit --max-output-bytes; select a larger budget.",
+        "delivery": {"max_output_bytes": max_output_bytes, "serialized_output_bytes": 0,
+                     "complete": False, "omitted_metadata": True},
+        "continuation": {"next_steps": []},
+    }
+    delivery = payload["source_expansion"]["delivery"]
+    return serialized()
+
+
 def _escape_source_expansion_record_headers(text: str) -> str:
     return "\n".join(
         f"  {line}" if SOURCE_EXPANSION_TEXT_RECORD_HEADER_RE.fullmatch(line) else line
         for line in text.split("\n")
     )
+
+
+def _source_expansion_delivery_lines(report: dict) -> list[str]:
+    lines = []
+    if report.get("error"):
+        lines.append("Error: " + str(report["error"]))
+    if report.get("delivery"):
+        lines.append("Delivery: " + json.dumps(report["delivery"], ensure_ascii=False))
+        lines.append("Projection: " + json.dumps(report.get("projection_summary") or {}, ensure_ascii=False))
+        lines.append("Boundaries: " + json.dumps(report.get("boundary_flags") or {}, ensure_ascii=False))
+        lines.append("Source acquisition: " + json.dumps(report.get("source_acquisition") or {}, ensure_ascii=False))
+        for step in (report.get("continuation") or {}).get("next_steps") or []:
+            lines.append("Continue " + step["direction"] + ": " + shlex.join(step["argv"]))
+    return lines
 
 
 def render_source_expansion_text(payload: dict) -> str:
@@ -3857,11 +4074,17 @@ def render_source_expansion_text(payload: dict) -> str:
             "Required tail read: "
             f"{source_continuation.get('exact_next_read_more_command')}"
         )
+    lines.extend(_source_expansion_delivery_lines(report))
     for record in report.get("records", []):
         lines.append(f"- {record.get('target')}: {record.get('role') or '(role unknown)'}")
+        if report.get("delivery"):
+            lines.append(f"Text span: {record.get('text_byte_start')}..{record.get('text_byte_end')}/{record.get('raw_text_bytes')} sha256={record.get('text_sha256')}")
+        for key in ("native_item", "preview_envelope"):
+            if key in record:
+                lines.append(f"{key}: " + json.dumps(record[key], ensure_ascii=False))
         text = str(record.get("text") or "")
         if text:
-            lines.append(_escape_source_expansion_record_headers(text))
+            lines.append(text if record.get("projection") == "full" else _escape_source_expansion_record_headers(text))
     for warning in report.get("warnings", []):
         lines.append(f"Warning: {warning}")
     return "\n".join(lines)
@@ -3900,8 +4123,12 @@ def render_source_expansion_markdown(payload: dict) -> str:
         lines.append(
             f"- **Required tail read:** `{source_continuation.get('exact_next_read_more_command')}`"
         )
+    lines.extend(_source_expansion_delivery_lines(report))
     for record in report.get("records", []):
         lines.extend(["", f"## {record.get('target')}", "", str(record.get("text") or "")])
+        for key in ("native_item", "preview_envelope", "text_byte_start", "text_byte_end", "raw_text_bytes", "text_sha256"):
+            if key in record:
+                lines.append(f"{key}: " + json.dumps(record[key], ensure_ascii=False))
     return "\n".join(lines)
 
 
