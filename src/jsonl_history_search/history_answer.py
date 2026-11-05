@@ -58,9 +58,10 @@ class NativeSession:
     entries: list = field(default_factory=list)
     retained_cost: int = 0
     retention_omitted: int = 0
-    auxiliary_closed: bool = False
-    auxiliary_omitted: int = 0
-    auxiliary_evicted: int = 0
+    preview_allowance: int | None = None
+    preview_reductions: int = 0
+    first_unrepresented_ref: dict | None = None
+    report_core_omitted: int = 0
     clipped: int = 0
     pending: dict = field(default_factory=dict)
     pending_overflow: int = 0
@@ -166,7 +167,7 @@ def resolve_native_target(sessions, request_session, *, parent_requested, main_r
 
 INTERVAL_FIELDS = ('anchor', 'anchor_time', 'entries', 'pending', 'retained_cost',
                    'after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped',
-                   'auxiliary_closed', 'auxiliary_omitted', 'auxiliary_evicted')
+                   'preview_allowance', 'preview_reductions', 'first_unrepresented_ref', 'report_core_omitted')
 
 
 def resolve_request_boundary(state, request_turn, live_request, boundary):
@@ -221,8 +222,11 @@ def resolve_request_boundary(state, request_turn, live_request, boundary):
                     state.pending[call] = value
                 elif call not in state.pending:
                     state.pending_overflow += 1
-            state.auxiliary_closed = state.auxiliary_closed or prior['auxiliary_closed']
-            for field in ('after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped', 'auxiliary_omitted', 'auxiliary_evicted'):
+            allowances = [value for value in (state.preview_allowance, prior['preview_allowance']) if value is not None]
+            state.preview_allowance = min(allowances) if allowances else None
+            refs = [ref for ref in (state.first_unrepresented_ref, prior['first_unrepresented_ref']) if ref]
+            state.first_unrepresented_ref = min(refs, key=reference_key) if refs else None
+            for field in ('after_anchor', 'interval_raw_records', 'retention_omitted', 'clipped', 'preview_reductions', 'report_core_omitted'):
                 setattr(state, field, getattr(state, field) + prior[field])
     state.previous_interval = None
 
@@ -245,20 +249,21 @@ def finalize_native_attribution(state, boundary):
             state.boundary_complete = False
 
 
-def excerpt(record, *, kind, mask_context, text=None, limit=4096):
+def excerpt(record, *, kind, mask_context, text=None, limit=4096, protected=False):
     text = record.text if text is None else text
     if mask_context:
         text = mask_context.mask_text(text, source_path=record.path, source_index=record.line)
     original = len(text.encode())
     result = {'source_ref': evidence_ref(record),
         'timestamp': record.timestamp.astimezone(timezone.utc).isoformat() if record.timestamp else None,
-        'timestamp_quality': record.timestamp_quality, 'kind': kind,
-        'speaker': 'assistant' if kind == 'reported_claim' else 'tool' if kind.startswith('tool_') else 'unknown' if kind == 'native_record' else 'user',
+        'kind': kind,
         'text': clip(text, limit), 'text_complete': original <= limit, 'original_text_bytes': original}
+    if record.timestamp_quality != 'record':
+        result['timestamp_quality'] = record.timestamp_quality
     projection = native_retention_projection(record.raw or {}, text)
     if projection:
-        if projection.pop('auxiliary'):
-            result['auxiliary'] = True
+        auxiliary = projection.pop('auxiliary')
+        protected = protected or not auxiliary
         projected_text = projection.pop('text')
         projection['preview_complete'] = len(projected_text.encode()) <= limit
         fields = {'text': clip(projected_text, limit), 'text_complete': False, 'native_projection': projection}
@@ -268,16 +273,21 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
             result.update(fields)
     if kind == 'tool_invocation' and original > min(256, limit):
         result.update(text='', text_complete=False)
+    if protected:
+        result['text_is_core'] = True
     body = native_message_payload(record.raw or {})
-    for source, target in (('channel', 'native_channel'), ('sender', 'native_origin'), ('name', 'tool_name')):
+    for source, target in (('type', 'native_type'), ('channel', 'native_channel'), ('sender', 'native_origin'), ('name', 'tool_name')):
         if isinstance(body, dict) and isinstance(body.get(source), str):
             result[target] = clip(body[source], 256)
+    item = body.get('item') if isinstance(body, dict) else None
+    if isinstance(item, dict) and isinstance(item.get('type'), str):
+        result['native_item_type'] = clip(item['type'], 256)
     if kind == 'tool_result':
         # Exact returned process/git disposition lines may occur anywhere in a
         # long output; retain byte offsets, not an invented outcome summary.
         spans, offset = [], 0
         for line in text.splitlines(keepends=True):
-            if re.match(r'\s*(?:\[[^\]\n]+ [0-9a-f]{7,40}\]|Process exited with code [1-9]|Exit code: [1-9]|Session ID|Script running with cell ID|\d+ files? changed)', line):
+            if re.match(r'\s*(?:\[[^\]\n]+ [0-9a-f]{7,40}\]|Process exited with code -?\d+|Exit code: -?\d+|Session ID|Script running with cell ID|\d+ files? changed)', line):
                 span_text = clip(line.rstrip(), 1024)
                 spans.append({'text_byte_start': offset, 'text_byte_end': offset + len(span_text.encode()), 'text': span_text})
                 if len(spans) >= 16:
@@ -288,34 +298,55 @@ def excerpt(record, *, kind, mask_context, text=None, limit=4096):
     return result
 
 
-def evict_auxiliary(state):
-    """Reclaim optional payload once; no omitted-record ledger or refill loop."""
+def preview_candidate(entry, allowance):
+    """An exact literal prefix, never a guessed summary or altered native span."""
+    if entry.get('text_is_core'):
+        return entry
+    text = clip(entry['text'], allowance)
+    if text == entry['text']:
+        return entry
+    candidate = {**entry, 'text': text, 'text_complete': False}
+    if entry.get('native_projection'):
+        candidate['native_projection'] = {**entry['native_projection'], 'preview_complete': False}
+    # A tiny complete string can cost less than its explicit gap metadata.
+    return candidate if entry_cost(candidate) <= entry_cost(entry) else entry
+
+
+def reduce_previews(state, allowance, budget):
+    """One shared allowance; prior/current snapshots retain their real costs."""
+    budget.check('chronology_retention')
     current, prior = vars(state), state.previous_interval
-    for interval in [current] + ([prior] if prior else []):
-        if interval['auxiliary_closed']:
-            continue
-        kept, freed, clipped, removed = [], 0, 0, 0
+    for interval in ([prior] if prior else []) + [current]:
         for entry in interval['entries']:
-            if entry.get('auxiliary'):
-                freed += len(encoded(entry)) + 1
-                clipped += not entry['text_complete']
-                removed += 1
-            else:
-                kept.append(entry)
-        interval['entries'] = kept
-        interval['retained_cost'] -= freed
-        interval['clipped'] -= clipped
-        interval['retention_omitted'] += removed
-        interval['auxiliary_omitted'] += removed
-        interval['auxiliary_evicted'] += removed
-        interval['auxiliary_closed'] = True
-        if interval is prior and not prior.get('shared_entries'):
-            # A pending latest-human boundary holds disjoint prior/current
-            # entries against one allowance. Supplied snapshots share a prefix.
-            state.retained_cost -= freed
+            candidate = preview_candidate(entry, allowance)
+            if candidate is not entry:
+                entry.update(candidate)
+        interval['preview_allowance'] = allowance
+        interval['preview_reductions'] += 1
+    # Shared-prefix snapshots reference the same mutable entries. Recount only
+    # after both views have been reduced, then charge a disjoint prior once.
+    for interval in ([prior] if prior else []) + [current]:
+        interval['retained_cost'] = sum(entry_cost(entry) for entry in interval['entries'])
+        interval['clipped'] = sum(not entry['text_complete'] for entry in interval['entries'])
+    if prior and not prior.get('shared_entries'):
+        state.retained_cost += prior['retained_cost']
+    budget.check('chronology_retention')
 
 
-def admit(state, entry, limit):
+def next_preview_allowance(state, entry=None):
+    if state.preview_allowance is not None:
+        return state.preview_allowance // 2
+    intervals = [state.entries] + ([state.previous_interval['entries']] if state.previous_interval else [])
+    return max((len(item['text'].encode()) for entries in intervals + ([[entry]] if entry else [])
+                for item in entries if not item.get('text_is_core')), default=0) // 2
+
+
+def note_unrepresented(state, ref):
+    if state.first_unrepresented_ref is None or reference_key(ref) < reference_key(state.first_unrepresented_ref):
+        state.first_unrepresented_ref = dict(ref)
+
+
+def admit(state, entry, limit, *, budget):
     # All interval records bind to this session's single physical source. Store
     # that identity once in the artifact header rather than thousands of times.
     if state.record_origin and state.record_origin['authorship'] == 'uncertain':
@@ -329,17 +360,17 @@ def admit(state, entry, limit):
             if 'byte_start' in ref:
                 keys.update({'native_ref', 'byte_start', 'byte_end'})
             entry[field] = {k: v for k, v in ref.items() if k in keys}
-    cost = len(encoded(entry)) + 1
-    auxiliary = entry.get('auxiliary', False)
-    if state.retained_cost + cost > limit and not auxiliary:
-        evict_auxiliary(state)
-    if state.retained_cost + cost > limit and entry['kind'] == 'tool_invocation' and entry['text']:
-        # Prefer the native invocation identity/association to a short preview.
-        entry.update(text='', text_complete=False)
-        cost = len(encoded(entry)) + 1
-    if (auxiliary and state.auxiliary_closed) or state.retained_cost + cost > limit:
+    if state.preview_allowance is not None:
+        entry.update(preview_candidate(entry, state.preview_allowance))
+    cost = entry_cost(entry)
+    while state.retained_cost + cost > limit and state.preview_allowance != 0:
+        allowance = next_preview_allowance(state, entry)
+        reduce_previews(state, allowance, budget)
+        entry.update(preview_candidate(entry, allowance))
+        cost = entry_cost(entry)
+    if state.retained_cost + cost > limit:
         state.retention_omitted += 1
-        state.auxiliary_omitted += auxiliary
+        note_unrepresented(state, entry['source_ref'])
         if entry['kind'] == 'tool_invocation' and entry.get('call_id'):
             state.invocation_admission_omitted += 1
         return
@@ -353,6 +384,20 @@ def admit(state, entry, limit):
             state.pending[entry['call_id']] = entry
         else:
             state.pending_overflow += 1
+            before = entry_cost(entry)
+            entry.pop('call_id')
+            state.retained_cost += entry_cost(entry) - before
+
+
+def take_pending_invocation(state, call):
+    """Resolved pairs use native refs; hashes belong only to pending lookup."""
+    invocation = state.pending.pop(call, None) if call else None
+    prior = state.previous_interval
+    if invocation and not (prior and prior['pending'].get(call) is invocation):
+        before = entry_cost(invocation)
+        invocation.pop('call_id', None)
+        state.retained_cost += entry_cost(invocation) - before
+    return invocation
 
 
 def begin_human_interval(state, record, *, body, timestamp, origin, uncertain_tail,
@@ -387,8 +432,9 @@ def begin_human_interval(state, record, *, body, timestamp, origin, uncertain_ta
     if not state.previous_interval:
         state.retained_cost = 0
     state.after_anchor = state.interval_raw_records = state.retention_omitted = state.clipped = 0
-    state.auxiliary_closed = False
-    state.auxiliary_omitted = state.auxiliary_evicted = 0
+    state.preview_allowance = None
+    state.preview_reductions = state.report_core_omitted = 0
+    state.first_unrepresented_ref = None
 
 
 def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context,
@@ -529,7 +575,7 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             if boundary.supplied and classification.label == TURN_CONTROL_OR_STATUS and record.text.strip():
                 # Status records can document genuine provider stops. Retain
                 # their source text without promoting them to human/tool proof.
-                admit(state, excerpt(record, kind='native_record', mask_context=mask_context), retained_limit)
+                admit(state, excerpt(record, kind='native_record', mask_context=mask_context, protected=True), retained_limit, budget=budget)
                 state.after_anchor += 1
             continue
         content = (raw.get('message') or {}).get('content') if claude and isinstance(raw.get('message'), dict) else None
@@ -546,12 +592,13 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                         entry['tool_name'] = clip(item['name'], 256)
                     raw_call = str((item.get('id') if invocation else item.get('tool_use_id')) or '')
                     call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
-                    entry['call_id'] = call or None
-                    if not invocation:
-                        matched = state.pending.pop(call, None) if call else None
+                    if invocation:
+                        entry['call_id'] = call or None
+                    else:
+                        matched = take_pending_invocation(state, call)
                         entry['invocation_ref'] = matched['source_ref'] if matched else None
                         entry['native_is_error'] = item.get('is_error')
-                    admit(state, entry, retained_limit)
+                    admit(state, entry, retained_limit, budget=budget)
                     state.after_anchor += 1
                     if not timestamp:
                         state.temporal_complete = False
@@ -576,10 +623,10 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             state.mirrors += 1
             original = state.entries[-1] if state.entries and reference_key(state.entries[-1]['source_ref']) == reference_key(previous[0]) else state.anchor if state.anchor and reference_key(state.anchor['source_ref']) == reference_key(previous[0]) else None
             if original is not None:
-                before = len(encoded(original))
+                before = entry_cost(original)
                 mirror_field = 'native_mirror_lines' if record.line else 'native_mirror_refs'
                 original[mirror_field] = [record.line] if record.line else [current_ref]
-                extra = len(encoded(original)) - before
+                extra = entry_cost(original) - before
                 if original is state.anchor or state.retained_cost + extra <= retained_limit:
                     if original is not state.anchor:
                         state.retained_cost += extra
@@ -610,7 +657,7 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
                         'start_ref': state.open_turn_ref if state.open_turn == native_turn else None}
                 else:
                     state.request_candidate, state.previous_interval = None, None
-                admit(state, entry, retained_limit)
+                admit(state, entry, retained_limit, budget=budget)
                 state.after_anchor += 1
                 continue
             begin_human_interval(state, record, body=body, timestamp=timestamp, origin=origin,
@@ -631,22 +678,21 @@ def scan_session(state, *, kind, default_tz, budget, stats, cutoff, mask_context
             call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
             if call:
                 entry['call_id'] = clip(call, 256)
-            admit(state, entry, retained_limit)
+            admit(state, entry, retained_limit, budget=budget)
         elif event in {'function_call_output', 'custom_tool_call_output', 'tool_result', 'tool_output'}:
             entry = excerpt(record, kind='tool_result', mask_context=mask_context,
                 text=text_from_item(body.get('output') or body.get('content')) or record.text)
             raw_call = str(body.get('call_id') or body.get('id') or '')
             call = hashlib.sha256(raw_call.encode()).hexdigest() if raw_call else ''
-            invocation = state.pending.pop(call, None) if call else None
-            entry['call_id'] = clip(call, 256) if call else None
+            invocation = take_pending_invocation(state, call)
             entry['invocation_ref'] = invocation['source_ref'] if invocation else None
-            admit(state, entry, retained_limit)
+            admit(state, entry, retained_limit, budget=budget)
         elif classification.label == ASSISTANT_OR_AGENT_MESSAGE:
-            admit(state, excerpt(record, kind='reported_claim', mask_context=mask_context), retained_limit)
+            admit(state, excerpt(record, kind='reported_claim', mask_context=mask_context), retained_limit, budget=budget)
         elif boundary.supplied:
             # Unsupported native items retain source text without inventing a
             # command invocation/result structure or association.
-            admit(state, excerpt(record, kind='native_record', mask_context=mask_context), retained_limit)
+            admit(state, excerpt(record, kind='native_record', mask_context=mask_context), retained_limit, budget=budget)
     state.complete = bool(state.native_scan.get('end_reached') and state.native_scan.get('end_complete'))
 
 
@@ -654,192 +700,154 @@ def reference_key(ref):
     return ref.get('byte_start', ref['line']), ref.get('content_index', -1)
 
 
-def report_ref(ref):
-    location = ref['native_ref'].partition('#')[2] if 'byte_start' in ref else 'L%s' % ref['line']
-    return location + ('[content %s]' % ref['content_index'] if 'content_index' in ref else '')
-
-
-def report_text(entry, allowance):
-    """Keep literal spans distinct from explicitly labeled native projections."""
-    prefix = clip(entry.get('text', ''), allowance)
+def entry_gaps(entry):
+    """Complement of exact literal ranges in the normalized/masked source text."""
+    original = entry['original_text_bytes']
     if entry.get('native_projection'):
-        original = entry['original_text_bytes']
-        complete = entry['native_projection']['preview_complete'] and prefix == entry['text']
-        body = ('Structural projection (not literal source-text offsets; full source requires read-more; '
-                'projection preview complete: %s):\n%s' % (complete, prefix))
-        return body, [(0, original)] if original else [], original
-    spans = [(0, prefix)] if prefix else []
-    remaining = allowance - len(prefix.encode())
-    end = len(prefix.encode())
-    for span in sorted(entry.get('outcome_spans', []), key=lambda value: value['text_byte_start']):
-        start = span['text_byte_start']
-        data = span['text'].encode()
-        # Prefix/span overlap is the same literal source range, never a second
-        # piece of evidence or extra covered bytes.
-        skipped = max(0, end - start)
-        value = clip(data[skipped:].decode('utf-8'), remaining)
-        if value:
-            start += skipped
-            spans.append((start, value))
-            remaining -= len(value.encode())
-            end = start + len(value.encode())
+        return [(0, original)] if original else []
+    ranges = [(0, len(entry['text'].encode()))]
+    ranges.extend((span['text_byte_start'], span['text_byte_end']) for span in entry.get('outcome_spans', []))
     end, gaps = 0, []
-    for start, text in spans:
+    for start, stop in sorted(ranges):
         if start > end:
             gaps.append((end, start))
-        end = start + len(text.encode())
-    original = entry.get('original_text_bytes')
-    if original is not None and end < original:
+        end = max(end, stop)
+    if end < original:
         gaps.append((end, original))
-    body = '\n'.join('text bytes [%s,%s):\n%s' % (start, start + len(text.encode()), text)
-                     for start, text in spans)
-    return body, gaps, original
+    return gaps
 
 
-def chronology_report(entries, anchor, *, cutoff, omissions, scope, source_complete,
-                      temporal_complete, pending, masked, budget, request_boundary=None, native_snapshot=None,
-                      source_path=None, boundary=None):
-    """One structural union, serialized once; no topic ranking or source reread."""
-    key = reference_key
-    calls = {key(e['source_ref']): e for e in entries if e['kind'] == 'tool_invocation'}
-    selected = {}
-    classes = {}
-    unresolved = {key(e['source_ref']): e['source_ref'] for e in pending.values()}
-    for entry in entries:
-        budget.check('chronology_report')
-        classes[entry['kind']] = classes.get(entry['kind'], 0) + 1
-        if entry['kind'] in {'reported_claim', 'tool_result', 'human_message', 'native_record'}:
-            selected[key(entry['source_ref'])] = entry
-            if entry.get('invocation_ref'):
-                ref = entry['invocation_ref']
-                selected[key(ref)] = calls.get(key(ref), {'source_ref': ref, 'kind': 'tool_invocation', 'text': '', 'text_complete': False})
-    for ref in unresolved:
-        if ref in calls:
-            selected[ref] = calls[ref]
-        else:
-            selected[ref] = {'source_ref': unresolved[ref], 'kind': 'tool_invocation', 'text': '', 'text_complete': False}
-    header = ('BOUNDED NATIVE CHRONOLOGY REPORT\nSource: %s\nScope: %s; parent verified: %s\n'
-        'Human boundary: %s\n%s\nCutoff: %s\nSource complete: %s; temporal complete: %s\n'
-        'Retention omissions: %s\nMasking enabled: %s\n'
-        'L123 denotes this source line 123; bytes=start:end:sha256 binds an exact physical record to Source (Source#bytes=...). Line 0 means physical line unknown. Content indices identify native parts. Native order, not timestamp rank.\n'
-        'ASSISTANT REPORT is unverified narrative; RETURNED OUTPUT is actual returned text. Native channel/origin/tool name unknown unless shown.\n'
-        'Invocation preview limited to already-complete text <=256 bytes. Invocation arguments omitted: clipped or longer; refs do not prove unseen arguments.\n'
-        'Projection: every retained assistant report, returned result, interval human message and unstructured native record, with paired/unresolved invocation refs. Disposition spans supplement literal prefixes. Child activity not established complete.\n'
-        'Readback: use read-more <Source>:<line> --mode record for L<line>, or read-more <Source>#<bytes locator> --mode record for bytes=...; content indices identify the part within that native record. Reuse the admitted root.\n'
-        'Text byte offsets describe the retained normalized/masked text; structural auxiliary projections are labeled separately and have no literal source-text offsets. Original byte size and omitted gaps do not imply unseen content. Projection coverage does not imply complete returned text.\n\n') % (
-            source_path or anchor['source_ref']['path'], scope, scope == 'proven_parent', report_ref(anchor['source_ref']) if anchor else 'none (supplied record-time interval)',
-            anchor['text'] if anchor else 'No human anchor inferred from timestamps.', cutoff.isoformat(), source_complete, temporal_complete,
-            json.dumps(omissions, separators=(',', ':')), bool(masked))
-    if (anchor and anchor.get('authorship') == 'uncertain') or (request_boundary and request_boundary['status'] == 'uncertain'):
-        header = header.replace('Human boundary:', 'Human boundary candidate (authorship or request exclusion uncertain):', 1)
-    if boundary:
-        header += 'Acquisition boundary: ' + json.dumps(boundary, separators=(',', ':')) + '\n\n'
-    if native_snapshot:
-        header += 'Native snapshot: ' + json.dumps(native_snapshot, separators=(',', ':')) + '\n\n'
-    if request_boundary:
-        header += 'Request boundary: ' + json.dumps(request_boundary, separators=(',', ':')) + '\n\n'
-    ordered = sorted(selected.items())
-    def blocks_for(allowance):
-        blocks = []
-        for ref, entry in ordered:
+def entry_payload(entry):
+    """The report and retention account use exactly the same record encoding."""
+    return {**entry, 'omitted_text_gaps': entry_gaps(entry)}
+
+
+def entry_cost(entry):
+    return len(encoded(entry_payload(entry))) + 1
+
+
+def chronology_omissions(states):
+    return {'native_control_records': sum(s.controls for s in states),
+        'native_event_mirrors': sum(s.mirrors for s in states),
+        'after_cutoff_records': sum(s.future for s in states),
+        'retention_records': sum(s.retention_omitted for s in states),
+        'clipped_retained_records': sum(s.clipped for s in states),
+        'pending_association_cap': sum(s.pending_overflow for s in states),
+        'invocation_admission_omitted_records': sum(s.invocation_admission_omitted for s in states),
+        'invocation_previews_omitted_records': sum(entry['kind'] == 'tool_invocation' and not entry['text']
+            and entry['original_text_bytes'] > 0 for s in states for entry in s.entries),
+        'structurally_projected_retained_records': sum('native_projection' in entry for s in states for entry in s.entries),
+        'opaque_payload_retained_records': sum(entry.get('native_projection', {}).get('kind') == 'reasoning_with_opaque_payload'
+            for s in states for entry in s.entries),
+        'usage_observation_readback_records': sum('info' in entry.get('native_projection', {}).get('omitted_fields', [])
+            for s in states for entry in s.entries),
+        'projected_original_text_bytes': sum(entry['original_text_bytes'] for s in states for entry in s.entries if 'native_projection' in entry),
+        'preview_reduction_passes': sum(s.preview_reductions for s in states),
+        'report_core_omitted_records': sum(s.report_core_omitted for s in states)}
+
+
+def chronology_report(state, *, states, cutoff, scope, source_complete,
+                      temporal_complete, masked, budget, boundary=None):
+    """Preserve cores before previews, including actual report framing cost."""
+    for entry in state.entries:
+        call = entry.get('call_id')
+        if call and state.pending.get(call) is not entry:
+            before = entry_cost(entry)
+            entry.pop('call_id')
+            state.retained_cost += entry_cost(entry) - before
+    other_cost = sum(s.retained_cost for s in states if s is not state)
+    limit = max(0, RETAIN_LIMIT - other_cost)
+
+    def framing():
+        omissions = chronology_omissions(states)
+        header = ('BOUNDED NATIVE CHRONOLOGY REPORT\nSource: %s\nScope: %s; parent verified: %s\n'
+            'Cutoff: %s\nSource complete: %s; temporal complete: %s\n'
+            'Human boundary: %s\nAcquisition boundary: %s\nNative snapshot: %s\nNative origin: %s\nRequest boundary: %s\n'
+            'Retention omissions: %s\nMasking enabled: %s\n'
+            'Each JSON line is one native event core plus its bounded preview. source_ref binds to Source; '
+            'line 0 means physical line unknown. Native order, not timestamp rank. '
+            'native_ref/byte ranges retain original native identity. Content indices identify native parts.\n'
+            'reported_claim is unverified assistant narrative; tool_result is actual returned output; '
+            'native_record has no inferred execution pairing. Missing channel/origin/name is unknown. '
+            'Absent timestamp_quality means record timestamp; temporal uncertainty remains separate.\n'
+            'text is a literal normalized/masked prefix unless native_projection is present. '
+            'outcome_spans are exact supplemental literal ranges. omitted_text_gaps are the exact complement '
+            'within original_text_bytes, not guessed unseen content. A native_projection has no literal '
+            'source-text coordinates; its complete original representation requires readback.\n'
+            'Readback: read-more <Source>:<line> --mode record, or read-more <native_ref> --mode record; '
+            'reuse the admitted root. Refs do not establish unseen arguments/outcomes. '
+            'Core membership, preview text, source/temporal coverage and final answers are independent.\n'
+            'Unresolved invocation refs: %s\nBEGIN NATIVE RECORDS\n') % (
+                state.path, scope, scope == 'proven_parent', cutoff.isoformat(), source_complete, temporal_complete,
+                encoded(state.anchor).decode() if state.anchor else 'none (supplied record-time interval)',
+                encoded(boundary).decode(), encoded(state.native_scan).decode(),
+                encoded(state.native_origin.retained() if state.native_origin else None).decode(), encoded(state.request_boundary).decode(),
+                encoded(omissions).decode(), bool(masked), encoded([value['source_ref'] for value in state.pending.values()]).decode())
+        classes, returned_gaps, requires_readback = {}, 0, bool(state.retention_omitted)
+        for entry in state.entries:
             budget.check('chronology_report')
-            kind = entry['kind']
-            label = ('ASSISTANT REPORT' if kind == 'reported_claim' else 'RETURNED OUTPUT' if kind == 'tool_result'
-                else 'HUMAN MESSAGE' if kind == 'human_message' else 'NATIVE RECORD (unstructured; no tool pairing proof)' if kind == 'native_record'
-                else 'UNRESOLVED INVOCATION' if ref in unresolved else 'INVOCATION')
-            fields = [report_ref(entry['source_ref']), label]
-            for field in ('authorship', 'native_channel', 'native_origin', 'tool_name'):
-                if entry.get(field):
-                    fields.append('%s=%s' % (field, entry[field]))
-            if entry.get('native_projection'):
-                fields.append('native projection=' + json.dumps(entry['native_projection'], separators=(',', ':')))
-            if kind == 'tool_result':
-                fields.append('invocation ' + report_ref(entry['invocation_ref']) if entry.get('invocation_ref') else 'association unavailable')
-            if entry.get('native_mirror_lines'):
-                fields.append('mirrors ' + ','.join('L%s' % n for n in entry['native_mirror_lines']))
-            if entry.get('native_mirror_refs'):
-                fields.append('mirrors ' + ','.join(report_ref(value) for value in entry['native_mirror_refs']))
-            preview = allowance
-            if kind == 'tool_invocation' and not (entry.get('text_complete')
-                    and len(entry.get('text', '').encode()) <= min(256, allowance)):
-                preview = 0
-            text, gaps, original = report_text(entry, preview)
-            fields.append('original text bytes: %s' % (original if original is not None else 'unknown; invocation text not retained'))
-            fields.append('omitted text gaps: ' + (','.join('[%s,%s)' % gap for gap in gaps) or ('none' if original is not None else 'unknown')))
-            if gaps or original is None:
-                fields.append('read-more ref=' + report_ref(entry['source_ref']))
-            data = (' | '.join(fields) + '\n' + (text + '\n' if text else '') + '\n').encode()
-            blocks.append((ref, kind, data, sum(end - start for start, end in gaps)))
-        return blocks
+            classes[entry['kind']] = classes.get(entry['kind'], 0) + 1
+            gaps = entry_gaps(entry)
+            requires_readback = requires_readback or bool(gaps)
+            if entry['kind'] == 'tool_result':
+                returned_gaps += sum(end - start for start, end in gaps)
+        metadata = {'records': len(state.entries),
+            'union_records': len(state.entries) + state.report_core_omitted,
+            'omitted_records': state.report_core_omitted,
+            'projection_complete': not state.report_core_omitted,
+            'core_membership_complete': not state.retention_omitted,
+            'selected_classes': classes, 'retained_classes': classes,
+            'routed_records': 0, 'returned_result_routes_complete': not state.retention_omitted,
+            'returned_text_complete': not (returned_gaps or state.retention_omitted),
+            'omitted_returned_text_bytes_in_emitted_records': returned_gaps,
+            'requires_source_readback': requires_readback,
+            'first_unrepresented_ref': ({'path': str(state.path), **state.first_unrepresented_ref}
+                if state.first_unrepresented_ref else None),
+            'limit_bytes': RETAIN_LIMIT}
+        footer = ('END NATIVE RECORDS\nCoverage: ' + encoded(metadata).decode()
+                  + '\nEND OF BOUNDED CHRONOLOGY REPORT\n')
+        return header.encode(), footer.encode(), metadata
 
-    def footer(blocks, count):
-        emitted = {}
-        for _, kind, _, _ in blocks[:count]:
-            emitted[kind] = emitted.get(kind, 0) + 1
-        omitted = blocks[count:]
-        # Even report-framing overflow routes omitted records by their native
-        # identities; it cannot relabel their missing previews as complete.
-        routes = []
-        for ref, kind, _, _ in omitted:
-            entry = selected[ref]
-            route = [report_ref(entry['source_ref']), kind,
-                'original text bytes=%s' % entry.get('original_text_bytes', 'unknown')]
-            if entry.get('native_projection'):
-                route.append('native projection=' + json.dumps(entry['native_projection'], separators=(',', ':')))
-            if kind == 'tool_result':
-                route.append('invocation=' + report_ref(entry['invocation_ref']) if entry.get('invocation_ref') else 'association unavailable')
-            elif ref in unresolved:
-                route.append('unresolved invocation')
-            routes.append(' | '.join(route))
-        ranges = '\n'.join(routes)
-        excluded = {kind: n - emitted.get(kind, 0) for kind, n in classes.items() if n > emitted.get(kind, 0)}
-        result_gaps = sum(gaps for _, kind, _, gaps in blocks[:count] if kind == 'tool_result')
-        result_complete = not result_gaps and not any(kind == 'tool_result' for _, kind, _, _ in omitted)
-        text = ('Projection complete: %s; emitted union records: %s/%s\nExcluded retained classes: %s\n'
-                'Returned text complete: %s; omitted returned text bytes within emitted records: %s\n'
-                'Omitted previews; each complete text is omitted, use read-more for native refs:\n%s\nSource/temporal/retention/display/answer completeness remain independent of projection coverage.\nEND OF BOUNDED CHRONOLOGY REPORT\n' % (
-                    not omitted, count, len(blocks), json.dumps(excluded, separators=(',', ':')),
-                    result_complete, result_gaps, ranges or 'none')).encode()
-        return text, emitted, result_complete, result_gaps
-
-    data = header.encode()
-    # Prefer every record's membership/association over long individual previews.
-    # The finite reductions derive from actual retained bytes and the existing
-    # serialized report ceiling, not a new source or preview allowance.
-    allowance = max((len(e.get('text', '').encode()) + sum(len(span['text'].encode()) for span in e.get('outcome_spans', []))
-                     for _, e in ordered), default=0)
     while True:
-        blocks = blocks_for(allowance)
-        count = len(blocks)
-        tail, emitted, result_complete, result_gaps = footer(blocks, count)
-        size = len(data) + sum(len(block) for _, _, block, _ in blocks)
-        if size + len(tail) <= RETAIN_LIMIT or not allowance:
-            break
-        allowance //= 2
-    while count and size + len(tail) > RETAIN_LIMIT:
         budget.check('chronology_report')
-        count -= 1
-        size -= len(blocks[count][2])
-        tail, emitted, result_complete, result_gaps = footer(blocks, count)
-    if size + len(tail) > RETAIN_LIMIT:
-        raise OSError('chronology report framing exceeds report allowance')
-    return data + b''.join(block for _, _, block, _ in blocks[:count]) + tail, {
-        'records': count, 'union_records': len(blocks), 'omitted_records': len(blocks) - count,
-        'projection_complete': count == len(blocks), 'selected_classes': emitted,
-        'routed_records': len(blocks) - count, 'returned_result_routes_complete': True,
-        'retained_classes': classes, 'returned_text_complete': result_complete,
-        'omitted_returned_text_bytes_in_emitted_records': result_gaps, 'requires_source_readback': count != len(blocks) or any(gaps for _, _, _, gaps in blocks)
-            or any(entry.get('original_text_bytes') is None for entry in selected.values()),
-        'limit_bytes': RETAIN_LIMIT}
+        header, footer, metadata = framing()
+        deficit = len(header) + state.retained_cost + len(footer) - limit
+        if deficit <= 0:
+            break
+        if state.preview_allowance != 0:
+            reduce_previews(state, next_preview_allowance(state), budget)
+            continue
+        # Only measured minimum-core/framing overflow may omit event cores.
+        # Keep one earliest unrepresented native ref, never an unbounded ledger.
+        if not state.entries:
+            raise OSError('minimum chronology framing exceeds retained allowance')
+        freed = 0
+        while state.entries and freed < deficit:
+            entry = state.entries.pop()
+            cost = entry_cost(entry)
+            freed += cost
+            state.retained_cost -= cost
+            state.clipped -= not entry['text_complete']
+            state.retention_omitted += 1
+            state.report_core_omitted += 1
+            note_unrepresented(state, entry['source_ref'])
+            call = entry.get('call_id')
+            if call and state.pending.get(call) is entry:
+                del state.pending[call]
+    core_bytes = sum(min(entry_cost(entry), entry_cost(preview_candidate(entry, 0))) for entry in state.entries)
+    records = b''.join(encoded(entry_payload(entry)) + b'\n' for entry in state.entries)
+    framing_bytes = len(header) + len(footer)
+    return header + records + footer, {**metadata,
+        'record_bytes': state.retained_cost, 'core_bytes': core_bytes,
+        'optional_preview_bytes': state.retained_cost - core_bytes,
+        'framing_bytes': framing_bytes, 'shared_retained_bytes': other_cost + state.retained_cost + framing_bytes}
 
 
-def retain_interval(entries, anchor, *, cutoff, omissions, scope, source_complete,
-                    temporal_complete, pending, masked, budget, request_boundary=None, native_snapshot=None,
-                    source_path=None, boundary=None):
-    data, projection = chronology_report(entries, anchor, cutoff=cutoff, omissions=omissions,
+def retain_interval(state, *, states, cutoff, scope, source_complete,
+                    temporal_complete, masked, budget, boundary=None):
+    data, projection = chronology_report(state, states=states, cutoff=cutoff,
         scope=scope, source_complete=source_complete, temporal_complete=temporal_complete,
-        pending=pending, masked=masked, budget=budget, request_boundary=request_boundary, native_snapshot=native_snapshot,
-        source_path=source_path, boundary=boundary)
+        masked=masked, budget=budget, boundary=boundary)
     budget.check('chronology_report')
     directory = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'jsonl-history-search' / 'interval-evidence'
     # Check existing ancestors before creating anything: a rejected link must
@@ -886,7 +894,8 @@ def display_entries(entries, allowance, contexts, path):
                     following.append(subsequent)
             if not following and not event.get('outcome_spans'):
                 continue
-            calls = [e for e in group[:position] if e['kind'] == 'tool_invocation' and e.get('call_id') == event.get('call_id')]
+            calls = [e for e in group[:position] if e['kind'] == 'tool_invocation' and event.get('invocation_ref')
+                     and reference_key(e['source_ref']) == reference_key(event['invocation_ref'])]
             for e in (calls[-1:] + [event] + following):
                 if e not in chosen:
                     chosen.append(e)
@@ -990,7 +999,7 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             stats.note_partial(path=path, reason='native session boundary/ordering unsupported; ordinary provider retrieval remains available')
             continue
         try:
-            retained_limit = max(0, RETAIN_LIMIT - 8192 - sum(s.retained_cost for s in states))
+            retained_limit = max(0, RETAIN_LIMIT - sum(s.retained_cost for s in states))
             scan_session(state, kind=kind, default_tz=default_tz, budget=budget, stats=stats,
                 cutoff=cutoff, mask_context=mask_context, retained_limit=retained_limit,
                 request_session=request_session, request_turn=request_turn, query=query, live_request=live_request,
@@ -1057,30 +1066,18 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
     if chosen and requested_cwd and chosen.cwd and Path(chosen.cwd).resolve() != Path(requested_cwd).resolve():
         complete = False
         stats.note_partial(reason='selected native session cwd differs from caller cwd; useful selected-source evidence is returned without parent verification')
-    entries = chosen.entries if chosen else [s.anchor for s in candidates if s.anchor][:max(0, min(30, plan.limits.max_matches))]
-    omissions = {'native_control_records': sum(s.controls for s in states), 'native_event_mirrors': sum(s.mirrors for s in states),
-        'after_cutoff_records': sum(s.future for s in states), 'retention_records': sum(s.retention_omitted for s in states),
-        'clipped_retained_records': sum(s.clipped for s in states), 'pending_association_cap': sum(s.pending_overflow for s in states)}
-    omissions.update({'auxiliary_retention_omitted_records': sum(s.auxiliary_omitted for s in states),
-        'auxiliary_evicted_records': sum(s.auxiliary_evicted for s in states),
-        'invocation_admission_omitted_records': sum(s.invocation_admission_omitted for s in states),
-        'invocation_previews_omitted_records': sum(entry['kind'] == 'tool_invocation' and not entry['text']
-            and entry['original_text_bytes'] > 0 for s in states for entry in s.entries)})
-    omissions.update({'structurally_projected_retained_records': sum('native_projection' in entry for s in states for entry in s.entries),
-        'opaque_payload_retained_records': sum(entry.get('native_projection', {}).get('kind') == 'reasoning_with_opaque_payload' for s in states for entry in s.entries),
-        'usage_observation_readback_records': sum('info' in entry.get('native_projection', {}).get('omitted_fields', []) for s in states for entry in s.entries),
-        'projected_original_text_bytes': sum(entry['original_text_bytes'] for s in states for entry in s.entries if 'native_projection' in entry)})
     artifact = None
     if chosen:
         try:
-            artifact = retain_interval(entries, chosen.anchor, cutoff=cutoff, omissions=omissions,
+            artifact = retain_interval(chosen, states=states, cutoff=cutoff,
                 scope=scope, source_complete=source_complete, temporal_complete=temporal,
-                pending=chosen.pending, masked=mask_context, budget=budget, request_boundary=chosen.request_boundary, native_snapshot=chosen.native_scan,
-                source_path=str(chosen.path), boundary=boundary_metadata)
+                masked=mask_context, budget=budget, boundary=boundary_metadata)
         except OSError as exc:
             stats.note_partial(reason='interval artifact unavailable: ' + str(exc))
             complete = False
         caps = sorted(set(cap_labels_from_warnings(plan.warnings) + budget.exhausted_reasons))
+    entries = chosen.entries if chosen else [s.anchor for s in candidates if s.anchor][:max(0, min(30, plan.limits.max_matches))]
+    omissions = chronology_omissions(states)
     if artifact and artifact['omitted_records']:
         omissions['artifact_records'] = artifact['omitted_records']
     limit = max(0, min(30, plan.limits.max_matches))
@@ -1124,7 +1121,13 @@ def retrieve_chronological_evidence(*, query, intent, plan, default_tz, budget,
             'untimed_records': sum(s.untimed for s in states), 'reversed_timestamps': sum(s.reversed for s in states),
             'post_anchor_records': chosen.after_anchor if chosen and not boundary.supplied else None, 'interval_artifact': artifact,
             'interval_raw_records': chosen.interval_raw_records if chosen else None,
-            'retained': {'bytes': sum(s.retained_cost for s in states), 'limit_bytes': RETAIN_LIMIT,
+            'retained': {'bytes': sum(s.retained_cost for s in states) + (artifact['framing_bytes'] if artifact else 0),
+                'record_bytes': sum(s.retained_cost for s in states),
+                'framing_bytes': artifact['framing_bytes'] if artifact else 0,
+                'first_unrepresented_ref': ({'path': str(chosen.path), **chosen.first_unrepresented_ref}
+                    if chosen and chosen.first_unrepresented_ref else None),
+                'limit_bytes': RETAIN_LIMIT, 'core_membership_complete': not omissions['retention_records'],
+                'text_complete': not omissions['clipped_retained_records'],
                 'complete': not (omissions['retention_records'] or omissions['clipped_retained_records'])},
             'display': {'contexts': len(evidence), 'records': display_count, 'retained_records': len(entries),
                 'complete': display_count == len(entries) and all(e.get('text_complete', all(r.get('text_complete') for r in e.get('records', []))) for e in evidence)},

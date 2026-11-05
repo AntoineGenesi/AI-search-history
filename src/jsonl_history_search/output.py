@@ -608,12 +608,17 @@ def render_history_evidence(payload: dict) -> str:
         if artifact:
             lines.extend(['Read the report as plain text: ' + artifact['path'],
                 'Report bytes: %s; SHA256: %s' % (artifact['bytes'], artifact['sha256']),
+                'Core membership complete: %s; core bytes: %s; optional preview bytes: %s; framing bytes: %s' % (
+                    artifact['core_membership_complete'], artifact['core_bytes'], artifact['optional_preview_bytes'], artifact['framing_bytes']),
                 'Projection complete: %s; omitted union records: %s' % (artifact['projection_complete'], artifact['omitted_records']),
                 'Returned text complete: %s; source readback needed: %s' % (artifact['returned_text_complete'], artifact['requires_source_readback']),
                 'Scope/cutoff: %s | %s' % (chronology['scope'], chronology['cutoff']),
                 'Check END OF BOUNDED CHRONOLOGY REPORT after reading; a truncated read is incomplete.',
                 'This report contains bounded retained evidence; follow its native read-more refs for omitted text. Child activity is not established complete.',
                 payload['claim_boundary']])
+            if artifact.get('first_unrepresented_ref'):
+                lines.append('First unrepresented native ref: ' + ref_target(artifact['first_unrepresented_ref'])
+                    + '; open it with read-more --mode record under the same admitted root. Event core coverage is partial.')
             return '\n'.join(lines)
         for item in payload['evidence']:
             if item.get('records'):
