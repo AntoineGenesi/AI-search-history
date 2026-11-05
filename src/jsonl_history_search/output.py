@@ -3830,6 +3830,7 @@ def render_bounded_source_expansion(
     acquired_tail = dict(report.get("source_continuation") or {})
     acquired_live_tail = dict(report.get("live_tail_caveat") or {})
     acquired_claim_boundaries = dict(report.get("claim_boundaries") or {})
+    omit_acquisition_details = False
     delivery = {"max_output_bytes": max_output_bytes, "serialized_output_bytes": 0,
                 "complete": True}
     report["delivery"] = delivery
@@ -3867,9 +3868,10 @@ def render_bounded_source_expansion(
         rows = report.get("records") or []
         omitted = selected_count - len(rows)
         body_omitted = sum(max(0, projections[row["target"]]["end"] - row["text_byte_end"]) for row in rows)
-        metadata_omitted = any(row.get("metadata_omissions") for row in rows)
         remaining_text = any(row["text_byte_end"] < row["raw_text_bytes"] for row in rows)
         partial_text = remaining_text or any(row["text_byte_start"] > 0 for row in rows)
+        acquisition_details_omitted = omit_acquisition_details and bool(omitted or body_omitted or partial_text)
+        metadata_omitted = acquisition_details_omitted or any(row.get("metadata_omissions") for row in rows)
         delivery.update({"complete": not omitted and not body_omitted and not metadata_omitted,
                          "selected_count": selected_count, "delivered_count": len(rows),
                          "omitted_record_count": omitted, "omitted_body_bytes": body_omitted,
@@ -3932,13 +3934,17 @@ def render_bounded_source_expansion(
         acquisition = report["source_acquisition"]
         acquisition.pop("source_continuation", None)
         acquisition.pop("live_tail_caveat", None)
+        acquisition.pop("omitted_detail_fields", None)
         if omitted or body_omitted or partial_text:
-            acquisition["source_continuation"] = {
-                **{key: value for key, value in acquired_tail.items() if key != "exact_next_read_more_command"},
-                "assessment_basis": "pre_delivery_source_selection",
-            }
-            acquisition["live_tail_caveat"] = {
-                **acquired_live_tail, "assessment_basis": "pre_delivery_source_selection"}
+            if acquisition_details_omitted:
+                acquisition["omitted_detail_fields"] = ["source_continuation", "live_tail_caveat"]
+            else:
+                acquisition["source_continuation"] = {
+                    **{key: value for key, value in acquired_tail.items() if key != "exact_next_read_more_command"},
+                    "assessment_basis": "pre_delivery_source_selection",
+                }
+                acquisition["live_tail_caveat"] = {
+                    **acquired_live_tail, "assessment_basis": "pre_delivery_source_selection"}
             # Selection-based assessments remain under source_acquisition. An
             # opened/delivered boundary cannot include rows or body bytes cut
             # by wire delivery, even if source acquisition inspected the tail.
@@ -3965,6 +3971,12 @@ def render_bounded_source_expansion(
             report["live_tail_caveat"] = {"applies": False,
                 "assessment_basis": "pre_delivery_source_selection",
                 "assessment_available_in": "source_acquisition.live_tail_caveat"}
+            if acquisition_details_omitted:
+                report["live_tail_caveat"] = {
+                    **{key: acquired_live_tail[key] for key in (
+                        "applies", "status", "terminal_state_status", "required_caveat", "reason"
+                    ) if key in acquired_live_tail},
+                    "assessment_basis": "pre_delivery_source_selection", "assessment_detail_omitted": True}
             report["claim_boundaries"]["terminal_session_conclusion"] = "not_allowed_from_incomplete_delivery"
         for step in steps:
             step["argv"] = argv_for(step)
@@ -4029,6 +4041,13 @@ def render_bounded_source_expansion(
 
         set_prefix(0)
         rendered = serialized()
+        if delivery["serialized_output_bytes"] > max_output_bytes:
+            # Keep exact acquired boundaries and delivered assessments, while
+            # preferring source text and executable continuation to explanatory
+            # acquisition detail. The omitted fields never imply no caveat.
+            omit_acquisition_details = True
+            refresh()
+            rendered = serialized()
         if delivery["serialized_output_bytes"] > max_output_bytes:
             # Optional descriptive fields must not make exact body text
             # permanently unreadable. Preserve ordinary native facts; omit a
