@@ -1883,7 +1883,6 @@ def payload_from_args(args: argparse.Namespace) -> tuple[dict, object, object]:
         date_window_start=explicit_window_start,
         date_window_end=explicit_window_end,
         date_reason="explicit_cli_window" if explicit_window_start is not None else None,
-        natural_timezone_declared=bool(args.timezone or args.timezone_offset),
     )
     current_session_only = (
         getattr(args, "command", None) == "semantic-wrapup"

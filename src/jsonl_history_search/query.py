@@ -230,7 +230,6 @@ def infer_query(
     date_window_start: datetime | None = None,
     date_window_end: datetime | None = None,
     date_reason: str | None = None,
-    natural_timezone_declared: bool = False,
 ) -> QueryIntent:
     normalized = " ".join(query.lower().split())
     recap = is_narrative_history_recap(query)
@@ -239,8 +238,7 @@ def infer_query(
     if recap:
         explicit = (RecordTimeInterval(date_window_start, date_window_end)
                     if date_window_start is not None and date_window_end is not None else None)
-        natural = supplied_recap_window(query, now.tzinfo,
-            timezone_declared=natural_timezone_declared, explicit_interval=explicit)
+        natural = supplied_recap_window(query, now.tzinfo, explicit_interval=explicit)
         interval = natural or explicit
         if interval:
             date_window_start, date_window_end = interval.start, interval.end
@@ -472,7 +470,7 @@ def _unquoted_recap_text(query):
     return ''.join(text), closing is not None
 
 
-def supplied_recap_window(query, default_tz, *, timezone_declared=False, explicit_interval=None):
+def supplied_recap_window(query, default_tz, *, explicit_interval=None):
     """Resolve requested record-time relations without authenticating named events.
 
     Independently asserted endpoints must agree with CLI bounds even when the
@@ -543,14 +541,11 @@ def supplied_recap_window(query, default_tz, *, timezone_declared=False, explici
             raise ValueError("Recap bounds need full ISO clock timestamps; date-only or relative endpoints are unresolved.")
         if re.search(r'\.\d{7,}', source):
             raise ValueError("Recap timestamps support at most six fractional digits; provide exact supported bounds without rounding.")
-        zoned = bool(re.search(r'(?:Z|[+-]\d{2}:\d{2})$', source, re.I))
-        if not zoned and not timezone_declared:
-            raise ValueError("Recap prose timestamps need offsets or an explicit --timezone/--timezone-offset.")
+        if not re.search(r'(?:Z|[+-]\d{2}:\d{2})$', source, re.I):
+            raise ValueError("Each recap prose timestamp must contain Z or an explicit ISO offset; timezone options do not supply prose endpoint offsets.")
         timestamp = parse_datetime(source.replace('t', 'T').replace('z', 'Z'), default_tz)
         if timestamp is None:
             raise ValueError("Recap interval needs valid ISO timestamps with end later than start.")
-        if not zoned and timestamp.replace(fold=0).utcoffset() != timestamp.replace(fold=1).utcoffset():
-            raise ValueError("Ambiguous or nonexistent local recap clock time; supply explicit ISO offsets.")
         inclusive = op in {'from', 'since', 'through'}
         is_lower = op in {'from', 'since', 'after'}
         parsed['start' if is_lower else 'end'] = (timestamp, inclusive)
