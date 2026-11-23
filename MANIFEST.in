@@ -1,17 +1,17 @@
 include README.md
-include ZIP-INSTALL.md
+include INSTALL.md
 include LICENSE
 include pyproject.toml
 include install/preflight.sh
 include install/install_codex_global.sh
-include scripts/search_jsonl_history.py
 include scripts/jsonl_ask_first.py
-recursive-include skills/codex *.md
-recursive-include skills/claude *.md
+recursive-include skills/codex *.md *.yaml
+recursive-include skills/claude *.md *.yaml
+recursive-include shareable-skills/history-evidence *.md *.yaml
 
 prune benchmarks
 prune codex
-prune docs
 prune reports
 prune skills/internal
 prune tests
+prune tools
